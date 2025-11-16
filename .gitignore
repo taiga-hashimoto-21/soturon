@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Pickle files
+*.pickle
+*.pkl
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model files (large)
+*.pth
+*.pt
+*.h5
+*.ckpt
+
+# Data files
+*.csv
+*.json
+*.hdf5
+
+# Logs
+*.log
+
+# Output files
+output/
+results/
+logs/
+
