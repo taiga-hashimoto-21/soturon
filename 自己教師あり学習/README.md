@@ -15,13 +15,32 @@
 
 ## 使用方法
 
-1. Colabで学習:
+1. **固定データセットの準備**（評価用）:
+   ```bash
+   cd 自己教師あり学習
+   python prepare_dataset.py
+   ```
+   これで `ssl_dataset.pickle` が作成されます（畳み込みと同じ方法で準備）。
+
+2. Colabで学習:
    - `ssl/train_colab.ipynb` をGoogle Colabで開く
    - 必要なファイルをアップロード
    - セルを順番に実行
+   - 学習時は動的にデータを生成（`use_fixed_dataset=False`）
 
-2. 評価:
+3. 評価:
    - ルートの `eval.py` を使用（ベースラインと共通）
+   - 評価時は固定データセットを使用（`use_fixed_dataset=True`）
+   ```python
+   from task.dataset import Task4Dataset
+   
+   # 評価時は固定データセットを使用
+   test_dataset = Task4Dataset(
+       pickle_path="data_lowF_noise.pickle",
+       use_fixed_dataset=True,
+       split='test',  # 'train', 'val', 'test'
+   )
+   ```
 
 ## タスク4: マスク予測 + 正則化項
 

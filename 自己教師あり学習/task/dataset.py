@@ -12,10 +12,13 @@ import sys
 import os
 
 # noiseモジュールをインポート（プロジェクトルートから）
-# ssl/task/ から noise/ へのパス: ../../noise/
+# ssl/task/ から ノイズの付与(共通)/ へのパス: ../../ノイズの付与(共通)/
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, project_root)
-from noise.add_noise import add_noise_to_interval
+# ノイズの付与(共通)フォルダをインポート
+noise_module_path = os.path.join(project_root, 'ノイズの付与(共通)')
+sys.path.insert(0, noise_module_path)
+from add_noise import add_noise_to_interval
 
 
 def process_noise(noise, clip_range=0.5, smoothing_factor=0.1):
@@ -104,10 +107,13 @@ class Task4Dataset(Dataset):
         add_structured_noise_flag: bool = True,
         structured_noise_clip_range: float = 0.5,
         structured_noise_smoothing_factor: float = 0.1,
+        use_fixed_dataset: bool = False,
+        fixed_dataset_path: str = None,
+        split: str = 'train',  # 'train', 'val', 'test'
     ):
         """
         Args:
-            pickle_path: data_lowF_noise.pickleのパス
+            pickle_path: data_lowF_noise.pickleのパス（use_fixed_dataset=Falseの場合）
             num_intervals: 区間数（デフォルト: 30）
             mask_ratio: マスクする区間の割合（デフォルト: 0.15 = 15%）
             noise_type: ノイズタイプ（'frequency_band', 'localized_spike', 'amplitude_dependent'）
@@ -115,6 +121,9 @@ class Task4Dataset(Dataset):
             add_structured_noise_flag: 全体的な構造化ノイズを付与するか（デフォルト: True）
             structured_noise_clip_range: 構造化ノイズのクリッピング範囲（デフォルト: 0.5）
             structured_noise_smoothing_factor: 構造化ノイズのスムージング係数（デフォルト: 0.1）
+            use_fixed_dataset: 固定データセットを使うか（デフォルト: False）
+            fixed_dataset_path: 固定データセットのパス（use_fixed_dataset=Trueの場合）
+            split: データセットの分割（'train', 'val', 'test'）
         """
         super().__init__()
         
@@ -126,41 +135,87 @@ class Task4Dataset(Dataset):
         self.add_structured_noise_flag = add_structured_noise_flag
         self.structured_noise_clip_range = structured_noise_clip_range
         self.structured_noise_smoothing_factor = structured_noise_smoothing_factor
+        self.use_fixed_dataset = use_fixed_dataset
+        self.split = split
         
-        # データを読み込み
-        self.data = self._load_pickle(self.pickle_path)
-        
-        # データの形状を確認・調整
-        if isinstance(self.data, dict):
-            self.x = np.asarray(self.data['x'], dtype=np.float32)
+        if use_fixed_dataset:
+            # 固定データセットを読み込み
+            if fixed_dataset_path is None:
+                # デフォルトパス: ssl_dataset.pickle（プロジェクトルートまたは自己教師あり学習フォルダ）
+                # pickle_pathの親の親（プロジェクトルート）を探す
+                possible_paths = [
+                    Path(pickle_path).parent.parent / 'ssl_dataset.pickle',  # プロジェクトルート
+                    Path(pickle_path).parent / 'ssl_dataset.pickle',  # 自己教師あり学習フォルダ
+                ]
+                fixed_dataset_path = None
+                for path in possible_paths:
+                    if path.exists():
+                        fixed_dataset_path = path
+                        break
+                if fixed_dataset_path is None:
+                    raise FileNotFoundError(f"固定データセットが見つかりません。以下のパスを確認してください: {possible_paths}")
+            
+            print(f"固定データセットを読み込み中: {fixed_dataset_path}")
+            fixed_data = self._load_pickle(fixed_dataset_path)
+            
+            # 分割に応じたデータを取得
+            split_data = fixed_data[split]
+            self.fixed_data = split_data['data']  # (N, 3000)
+            self.fixed_labels = split_data['labels']  # (N,)
+            self.fixed_masks = split_data['masks']  # (N, 3000)
+            
+            # 正規化パラメータを取得
+            config = fixed_data['config']
+            self.normalization_mean = config['normalization_mean']
+            self.normalization_std = config['normalization_std']
+            self.scale_factor = config['scale_factor']
+            
+            self.seq_len = self.fixed_data.shape[1]
+            self.points_per_interval = self.seq_len // self.num_intervals
+            
+            print(f"固定データセット読み込み完了:")
+            print(f"  Split: {split}")
+            print(f"  Samples: {len(self.fixed_data)}")
+            print(f"  Sequence length: {self.seq_len}")
+            print(f"  Intervals: {self.num_intervals}")
+            print(f"  Normalization mean: {self.normalization_mean:.6f}")
+            print(f"  Normalization std: {self.normalization_std:.6f}")
         else:
-            self.x = np.asarray(self.data, dtype=np.float32)
-        
-        # (N, 1, L) → (N, L)
-        if self.x.ndim == 3 and self.x.shape[1] == 1:
-            self.x = self.x.squeeze(1)
-        
-        assert self.x.ndim == 2, f"data shape must be (N, L), got {self.x.shape}"
-        
-        self.seq_len = self.x.shape[1]
-        self.points_per_interval = self.seq_len // self.num_intervals
-        
-        # baselineと同じ方法: 全データセットで統一した正規化のための統計を事前計算
-        # 注意: 動的にノイズを付与するため、代表的なサンプルで統計を計算
-        print("全データセットの正規化統計を計算中（baselineと同じ方法）...")
-        self.scale_factor = 2.5e24
-        self.normalization_mean, self.normalization_std = self._compute_global_normalization_stats()
-        
-        print(f"Dataset loaded:")
-        print(f"  Samples: {len(self.x)}")
-        print(f"  Sequence length: {self.seq_len}")
-        print(f"  Intervals: {self.num_intervals}")
-        print(f"  Points per interval: {self.points_per_interval}")
-        print(f"  Noise type: {self.noise_type}")
-        print(f"  Noise level: {self.noise_level}")
-        print(f"  Add structured noise: {self.add_structured_noise_flag}")
-        print(f"  Normalization mean: {self.normalization_mean:.6f}")
-        print(f"  Normalization std: {self.normalization_std:.6f}")
+            # 動的にデータを生成（学習時）
+            # データを読み込み
+            self.data = self._load_pickle(self.pickle_path)
+            
+            # データの形状を確認・調整
+            if isinstance(self.data, dict):
+                self.x = np.asarray(self.data['x'], dtype=np.float32)
+            else:
+                self.x = np.asarray(self.data, dtype=np.float32)
+            
+            # (N, 1, L) → (N, L)
+            if self.x.ndim == 3 and self.x.shape[1] == 1:
+                self.x = self.x.squeeze(1)
+            
+            assert self.x.ndim == 2, f"data shape must be (N, L), got {self.x.shape}"
+            
+            self.seq_len = self.x.shape[1]
+            self.points_per_interval = self.seq_len // self.num_intervals
+            
+            # baselineと同じ方法: 全データセットで統一した正規化のための統計を事前計算
+            # 注意: 動的にノイズを付与するため、代表的なサンプルで統計を計算
+            print("全データセットの正規化統計を計算中（baselineと同じ方法）...")
+            self.scale_factor = 2.5e24
+            self.normalization_mean, self.normalization_std = self._compute_global_normalization_stats()
+            
+            print(f"Dataset loaded:")
+            print(f"  Samples: {len(self.x)}")
+            print(f"  Sequence length: {self.seq_len}")
+            print(f"  Intervals: {self.num_intervals}")
+            print(f"  Points per interval: {self.points_per_interval}")
+            print(f"  Noise type: {self.noise_type}")
+            print(f"  Noise level: {self.noise_level}")
+            print(f"  Add structured noise: {self.add_structured_noise_flag}")
+            print(f"  Normalization mean: {self.normalization_mean:.6f}")
+            print(f"  Normalization std: {self.normalization_std:.6f}")
     
     def _load_pickle(self, path: Path):
         """pickleファイルを読み込む"""
@@ -230,7 +285,10 @@ class Task4Dataset(Dataset):
         return mean, std
     
     def __len__(self):
-        return self.x.shape[0]
+        if self.use_fixed_dataset:
+            return len(self.fixed_data)
+        else:
+            return self.x.shape[0]
     
     def __getitem__(self, idx):
         """
@@ -244,6 +302,24 @@ class Task4Dataset(Dataset):
                 'noise_interval': ノイズを付与した区間のインデックス (int)
             }
         """
+        if self.use_fixed_dataset:
+            # 固定データセットから取得
+            noisy_psd_norm = self.fixed_data[idx]  # 既に正規化済み
+            mask_positions = self.fixed_masks[idx]
+            noise_interval = self.fixed_labels[idx].item()
+            
+            # マスクを適用
+            masked_noisy_psd_norm = noisy_psd_norm.clone()
+            masked_noisy_psd_norm[mask_positions] = 0.0
+            
+            return {
+                'input': torch.tensor(masked_noisy_psd_norm, dtype=torch.float32),
+                'target': torch.tensor(noisy_psd_norm, dtype=torch.float32),
+                'mask': torch.tensor(mask_positions, dtype=torch.bool),
+                'noise_interval': torch.tensor(noise_interval, dtype=torch.long),
+            }
+        
+        # 動的にデータを生成（学習時）
         # 元のPSDデータ（ノイズなし）
         base_psd = self.x[idx].astype(np.float32)
         
