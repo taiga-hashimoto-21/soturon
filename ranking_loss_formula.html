@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ランキング損失の数式</title>
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>
+        window.MathJax = {
+            tex: {
+                inlineMath: [['$', '$'], ['\\(', '\\)']],
+                displayMath: [['$$', '$$'], ['\\[', '\\]']],
+                processEscapes: true,
+                processEnvironments: true
+            }
+        };
+    </script>
+    <style>
+        body {
+            font-family: 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic', 'Meiryo', sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #f5f5f5;
+            padding: 40px;
+        }
+        .container {
+            background-color: white;
+            padding: 60px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            max-width: 900px;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 40px;
+            font-size: 28px;
+        }
+        .equation-block {
+            margin: 40px 0;
+            padding: 30px;
+            background-color: #fafafa;
+            border-left: 4px solid #4a90e2;
+            border-radius: 5px;
+        }
+        .equation-label {
+            font-weight: bold;
+            color: #4a90e2;
+            margin-bottom: 15px;
+            font-size: 18px;
+        }
+        .math-display {
+            font-size: 20px;
+            text-align: center;
+            margin: 20px 0;
+            padding: 20px;
+            background-color: white;
+            border-radius: 5px;
+        }
+        .explanation {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #e8f4f8;
+            border-radius: 5px;
+            font-size: 14px;
+            line-height: 1.8;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ランキング損失の数式</h1>
+        
+        <div class="equation-block">
+            <div class="equation-label">数式 (3): ランキング損失</div>
+            <div class="math-display">
+                \[
+                \mathcal{L}_{\text{rank}}(A, \dot{Y}) = \sum_{i=1}^{T} (1 - \dot{Y}_{ij} \dot{Y}_{ik}) \max(m, \dot{Y}_{ij} a_{ij} + \dot{Y}_{ik} a_{ik})
+                \]
+            </div>
+            <div class="explanation">
+                <strong>説明:</strong><br>
+                • $\mathcal{L}_{\text{rank}}$: ランキング損失関数<br>
+                • $A$: アテンションウェイトの行列<br>
+                • $\dot{Y}$: ラベルの類似度（数式(4)で定義）<br>
+                • $\sum_{i=1}^{T}$: $T$個の要素について合計<br>
+                • $(1 - \dot{Y}_{ij} \dot{Y}_{ik})$: 損失の係数項<br>
+                • $\max(m, \dot{Y}_{ij} a_{ij} + \dot{Y}_{ik} a_{ik})$: マージン$m$とアテンションウェイトの線形結合の最大値<br>
+                • $a_{ij}$: 区間$i$と$j$の間のアテンションウェイト<br>
+                • $a_{ik}$: 区間$i$と$k$の間のアテンションウェイト<br>
+                • $m$: マージン（閾値）
+            </div>
+        </div>
+        
+        <div class="equation-block">
+            <div class="equation-label">数式 (4): ラベルの類似度</div>
+            <div class="math-display">
+                \[
+                \dot{Y}_{ij} = \begin{cases}
+                -1, & \text{if } \hat{Y}_i = \hat{Y}_j \\
+                +1, & \text{if } \hat{Y}_i \ne \hat{Y}_j
+                \end{cases}
+                \]
+            </div>
+            <div class="explanation">
+                <strong>説明:</strong><br>
+                • $\dot{Y}_{ij}$: 区間$i$と区間$j$の予測ラベル$\hat{Y}_i$と$\hat{Y}_j$の関係に基づいて定義されるバイナリ変数<br>
+                • $-1$: もし$\hat{Y}_i$と$\hat{Y}_j$が<strong>同じ</strong>ラベルである場合（例: 両方ともノイズ区間、または両方とも正常区間）<br>
+                • $+1$: もし$\hat{Y}_i$と$\hat{Y}_j$が<strong>異なる</strong>ラベルである場合（例: 一方がノイズ区間、もう一方が正常区間）<br>
+                • $\hat{Y}_i$: 区間$i$の予測ラベル（例: ノイズ区間か否か）
+            </div>
+        </div>
+        
+        <div class="explanation" style="margin-top: 30px;">
+            <strong>ノイズ検知への適用:</strong><br>
+            ノイズ区間($i$)と正常区間($k$)を比較する場合:<br>
+            • $\dot{Y}_{ik} = +1$（異なるラベル）<br>
+            • 損失関数は「正常区間のアテンション - ノイズ区間のアテンション $\geq m$」になるように学習<br>
+            • これにより、ノイズ区間のアテンションが正常区間より低くなる
+        </div>
+    </div>
+</body>
+</html>
+

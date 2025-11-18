@@ -4,9 +4,10 @@
 統合インターフェースとして機能
 """
 
-from .frequency_band_noise import add_frequency_band_noise
-from .localized_spike_noise import add_localized_spike_noise
-from .amplitude_dependent_noise import add_amplitude_dependent_noise
+# 相対インポートを絶対インポートに変更（Colab対応）
+from frequency_band_noise import add_frequency_band_noise
+from localized_spike_noise import add_localized_spike_noise
+from amplitude_dependent_noise import add_amplitude_dependent_noise
 
 
 def add_noise_to_interval(psd_data, interval_idx, noise_type='frequency_band', **kwargs):

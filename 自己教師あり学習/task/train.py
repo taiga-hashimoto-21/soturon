@@ -35,6 +35,8 @@ def compute_loss(
     lambda_reg=0.1,
     num_intervals=30,
     margin=0.1,
+    debug=False,
+    batch_idx=0,
 ):
     """
     損失関数を計算（ランキング損失を使用）
@@ -48,6 +50,8 @@ def compute_loss(
         lambda_reg: 正則化項の重み
         num_intervals: 区間数
         margin: ランキング損失のマージン
+        debug: デバッグ情報を出力するか
+        batch_idx: バッチインデックス（デバッグ用）
     
     Returns:
         total_loss: 総損失
@@ -64,6 +68,14 @@ def compute_loss(
     reg_loss = torch.tensor(0.0, device=predictions.device)
     
     if attention_weights is not None:
+        if debug and batch_idx == 0:
+            print(f"\n=== デバッグ情報 (バッチ {batch_idx}) ===")
+            print(f"attention_weights.shape: {attention_weights.shape}")
+            print(f"attention_weights.min(): {attention_weights.min().item():.6f}")
+            print(f"attention_weights.max(): {attention_weights.max().item():.6f}")
+            print(f"attention_weights.mean(): {attention_weights.mean().item():.6f}")
+            print(f"attention_weights.std(): {attention_weights.std().item():.6f}")
+            print(f"noise_intervals: {noise_intervals.cpu().numpy()}")
         # CLSトークンから各区間へのアテンションを取得
         B = attention_weights.shape[0]
         L = predictions.shape[1]
@@ -86,6 +98,21 @@ def compute_loss(
         
         interval_attention = torch.stack(interval_attention_list)  # (B, num_intervals)
         
+        # アテンションウェイトをスケーリング（値が小さいため）
+        # 現在の値: 0.0003程度 → 100倍で0.03程度にする（損失が適切な範囲になるように）
+        attention_scale = 100.0
+        interval_attention = interval_attention * attention_scale
+        
+        if debug and batch_idx == 0:
+            print(f"\n区間ごとのアテンション:")
+            print(f"interval_attention.shape: {interval_attention.shape}")
+            print(f"interval_attention.min(): {interval_attention.min().item():.6f}")
+            print(f"interval_attention.max(): {interval_attention.max().item():.6f}")
+            print(f"interval_attention.mean(): {interval_attention.mean().item():.6f}")
+            print(f"interval_attention.std(): {interval_attention.std().item():.6f}")
+            print(f"\n最初のサンプル (i=0) の区間アテンション:")
+            print(f"  全区間のアテンション: {interval_attention[0].detach().cpu().numpy()}")
+        
         # ランキング損失を計算（数式(3)と(4)に基づく）
         ranking_losses = []
         for i in range(B):
@@ -96,6 +123,14 @@ def compute_loss(
             normal_indices = [j for j in range(num_intervals) if j != noise_idx]
             normal_attn_list = interval_attention[i, normal_indices]
             
+            if debug and batch_idx == 0 and i == 0:
+                print(f"\nサンプル {i} の詳細:")
+                print(f"  ノイズ区間インデックス: {noise_idx}")
+                print(f"  ノイズ区間のアテンション: {noise_attn.item():.6f}")
+                print(f"  正常区間のアテンション (最初の5つ): {normal_attn_list[:5].detach().cpu().numpy()}")
+                print(f"  正常区間のアテンション平均: {normal_attn_list.mean().item():.6f}")
+                print(f"  正常区間 - ノイズ区間: {(normal_attn_list.mean() - noise_attn).item():.6f}")
+            
             # 数式(4): Y_dot_ij = { -1, if Y_hat_i = Y_hat_j ; +1, if Y_hat_i ≠ Y_hat_j }
             # ノイズ検知の場合:
             # - ノイズ区間: Y_hat = 1
@@ -104,7 +139,7 @@ def compute_loss(
             # ノイズ区間(i) vs ノイズ区間(j): Y_dot_ij = -1 (同じラベル)
             # ノイズ区間(i) vs 正常区間(k): Y_dot_ik = +1 (異なるラベル)
             
-            for normal_attn in normal_attn_list:
+            for idx_in_normal_list, normal_attn in enumerate(normal_attn_list):
                 # 数式(3): L_rank = (1 - Y_dot_ij * Y_dot_ik) * max(m, Y_dot_ij * a_ij + Y_dot_ik * a_ik)
                 # 
                 # ノイズ区間(i) vs ノイズ区間(j) vs 正常区間(k)の場合:
@@ -131,15 +166,37 @@ def compute_loss(
                 # = (-1) * noise_attn + (+1) * normal_attn
                 # = normal_attn - noise_attn
                 
-                # max(margin, Y_dot_ij * a_ij + Y_dot_ik * a_ik)
-                max_term = torch.max(torch.tensor(margin, device=attn_linear.device), attn_linear)
+                # ランキング損失の計算を修正
+                # 目的: normal_attn - noise_attn > margin になるように学習
+                # 損失 = max(0, margin - attn_linear)
+                # - attn_linearが大きい（良い状態）→ 損失が小さい
+                # - attn_linearが小さい/マイナス（悪い状態）→ 損失が大きい
+                max_term = torch.clamp(margin - attn_linear, min=0.0)
                 
                 # 数式(3): (1 - Y_dot_ij * Y_dot_ik) * max(m, Y_dot_ij * a_ij + Y_dot_ik * a_ik)
-                loss_term = coeff * max_term  # = 2 * max(margin, normal_attn - noise_attn)
+                loss_term = coeff * max_term
                 ranking_losses.append(loss_term)
+                
+                if debug and batch_idx == 0 and i == 0 and len(ranking_losses) <= 5:
+                    normal_interval_idx = normal_indices[idx_in_normal_list]
+                    print(f"    正常区間 {normal_interval_idx}:")
+                    print(f"      normal_attn: {normal_attn.item():.6f}")
+                    print(f"      attn_linear (normal - noise): {attn_linear.item():.6f}")
+                    print(f"      max_term: {max_term.item():.6f}")
+                    print(f"      loss_term: {loss_term.item():.6f}")
         
         if len(ranking_losses) > 0:
-            reg_loss = lambda_reg * torch.stack(ranking_losses).mean()
+            avg_ranking_loss = torch.stack(ranking_losses).mean()
+            reg_loss = lambda_reg * avg_ranking_loss
+            
+            if debug and batch_idx == 0:
+                print(f"\nランキング損失の統計:")
+                print(f"  ranking_losses数: {len(ranking_losses)}")
+                print(f"  平均ランキング損失: {avg_ranking_loss.item():.6f}")
+                print(f"  lambda_reg: {lambda_reg}")
+                print(f"  reg_loss (lambda_reg * avg): {reg_loss.item():.6f}")
+                print(f"  margin: {margin}")
+                print("=" * 60)
     
     # 3. 総損失
     total_loss = mask_loss + reg_loss
@@ -261,7 +318,7 @@ def train_task4(
         running_mask_loss = 0.0
         running_reg_loss = 0.0
         
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             x = batch["input"].to(device)
             y = batch["target"].to(device)
             m = batch["mask"].to(device)
@@ -272,12 +329,19 @@ def train_task4(
             with autocast(enabled=(device == "cuda")):
                 pred, cls_out, attention_weights = model(x, m, return_attention=True)
                 
+                # 最初のバッチのみデバッグ情報を出力
+                debug_flag = (epoch == start_epoch and batch_idx == 0)
+                
                 total_loss, mask_loss, reg_loss = compute_loss(
                     pred, y, m, attention_weights, noise_intervals,
-                    lambda_reg=lambda_reg, num_intervals=num_intervals, margin=margin
+                    lambda_reg=lambda_reg, num_intervals=num_intervals, margin=margin,
+                    debug=debug_flag, batch_idx=batch_idx
                 )
             
             scaler.scale(total_loss).backward()
+            # 勾配クリッピングを追加（勾配の爆発を防ぐ）
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             
@@ -426,15 +490,15 @@ if __name__ == "__main__":
         pickle_path="data_lowF_noise.pickle",
         batch_size=16,  # 8 → 16に増やして速度向上
         num_epochs=10,  # 一旦10エポックに設定
-        lr=1e-4,
+        lr=1e-3,  # 1e-4 → 1e-3に変更（正則化項の学習を促進）
         val_ratio=0.2,
         device=device,
         out_dir="task4_output",
         resume=True,
-        lambda_reg=0.1,
+        lambda_reg=2.0,  # 0.1 → 2.0に変更（正則化項の重みを大きく）
         num_intervals=30,
         noise_type='frequency_band',
         noise_level=0.3,
-        margin=0.1,
+        margin=0.01,  # 0.1 → 0.01に変更（学習が進みやすくする）
     )
 

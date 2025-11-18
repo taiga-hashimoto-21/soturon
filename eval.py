@@ -153,7 +153,10 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
                     
                     cls_attention = torch.stack(cls_attention_intervals, dim=1)  # (B, num_intervals)
                 
+                # 学習時と同じスケーリングを適用（train.pyと一致させる）
                 if cls_attention is not None:
+                    attention_scale = 100.0  # train.pyと同じ値（10000 → 100に変更）
+                    cls_attention = cls_attention * attention_scale
                     all_attention_weights.append(cls_attention.cpu())
                     all_labels.append(labels.cpu())
     
@@ -194,6 +197,8 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
     print(f"  差（正常 - ノイズ）: {attention_diff:.6f}")
     
     # 閾値を最適化（F1-scoreが最大になる閾値を選択）
+    # 設計意図: ノイズ区間のアテンション < 正常区間のアテンション
+    # → アテンションが低い区間をノイズと判定
     print("閾値を最適化中...")
     thresholds = np.linspace(all_attention.min(), all_attention.max(), 50)  # 100 → 50に減らす
     best_threshold = None
@@ -223,15 +228,24 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
             best_threshold = threshold
             best_accuracy = accuracy
     
-    # 最適な閾値で最終予測
-    final_predictions = []
-    for i in range(len(all_labels)):
-        noisy_intervals = np.where(all_attention[i] < best_threshold)[0]
-        if len(noisy_intervals) > 0:
-            final_predictions.append(noisy_intervals[np.argmin(all_attention[i, noisy_intervals])])
-        else:
-            final_predictions.append(np.argmin(all_attention[i]))
-    final_predictions = np.array(final_predictions)
+    # best_thresholdがNoneの場合のフォールバック処理
+    if best_threshold is None:
+        print("警告: 最適な閾値が見つかりませんでした。デフォルトの方法を使用します。")
+        # 最もアテンションウェイトが低い区間を予測する方法にフォールバック
+        final_predictions = np.array([np.argmin(all_attention[i]) for i in range(len(all_labels))])
+        best_threshold = all_attention.mean()  # 平均値をデフォルト閾値として設定
+        best_f1 = f1_score(all_labels, final_predictions, average='macro', zero_division=0)
+        best_accuracy = accuracy_score(all_labels, final_predictions)
+    else:
+        # 最適な閾値で最終予測
+        final_predictions = []
+        for i in range(len(all_labels)):
+            noisy_intervals = np.where(all_attention[i] < best_threshold)[0]
+            if len(noisy_intervals) > 0:
+                final_predictions.append(noisy_intervals[np.argmin(all_attention[i, noisy_intervals])])
+            else:
+                final_predictions.append(np.argmin(all_attention[i]))
+        final_predictions = np.array(final_predictions)
     
     # baselineと同じ方法: CrossEntropyLossで評価
     # アテンションウェイトからlogitsを生成（最もアテンションウェイトが低い区間がノイズ）
@@ -253,6 +267,7 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
     cm = confusion_matrix(all_labels, final_predictions)
     
     # ROC-AUC（二値分類として扱う）
+    # アテンションウェイトが低いほどノイズの可能性が高い
     y_true_binary = []
     y_score_binary = []
     for i, label in enumerate(all_labels):
