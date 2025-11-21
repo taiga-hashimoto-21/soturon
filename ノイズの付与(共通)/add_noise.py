@@ -1,33 +1,33 @@
 """
-測定系由来のノイズを付与するモジュール
+実験者のスキルに依存するノイズを付与するモジュール
 3つのパターンのノイズ生成関数を提供
 統合インターフェースとして機能
 """
 
 # 相対インポートを絶対インポートに変更（Colab対応）
-from frequency_band_noise import add_frequency_band_noise
-from localized_spike_noise import add_localized_spike_noise
-from amplitude_dependent_noise import add_amplitude_dependent_noise
+from power_supply_noise import add_power_supply_noise
+from interference_noise import add_interference_noise
+from clock_leakage_noise import add_clock_leakage_noise
 
 
-def add_noise_to_interval(psd_data, interval_idx, noise_type='frequency_band', **kwargs):
+def add_noise_to_interval(psd_data, interval_idx, noise_type='power_supply', **kwargs):
     """
     統一インターフェース: ノイズタイプを指定してノイズを付与
     
     Args:
         psd_data: PSDデータ
-        interval_idx: ノイズを加える区間のインデックス
-        noise_type: 'frequency_band', 'localized_spike', 'amplitude_dependent' のいずれか
+        interval_idx: ノイズを加える区間のインデックス（新しいノイズは全体に適用されるため無視される）
+        noise_type: 'power_supply', 'interference', 'clock_leakage' のいずれか
         **kwargs: 各ノイズ関数への追加パラメータ
     
     Returns:
         ノイズを加えたPSDデータ, 開始インデックス, 終了インデックス
     """
-    if noise_type == 'frequency_band':
-        return add_frequency_band_noise(psd_data, interval_idx, **kwargs)
-    elif noise_type == 'localized_spike':
-        return add_localized_spike_noise(psd_data, interval_idx, **kwargs)
-    elif noise_type == 'amplitude_dependent':
-        return add_amplitude_dependent_noise(psd_data, interval_idx, **kwargs)
+    if noise_type == 'power_supply':
+        return add_power_supply_noise(psd_data, interval_idx, **kwargs)
+    elif noise_type == 'interference':
+        return add_interference_noise(psd_data, interval_idx, **kwargs)
+    elif noise_type == 'clock_leakage':
+        return add_clock_leakage_noise(psd_data, interval_idx, **kwargs)
     else:
-        raise ValueError(f"Unknown noise type: {noise_type}. Choose from 'frequency_band', 'localized_spike', 'amplitude_dependent'")
+        raise ValueError(f"Unknown noise type: {noise_type}. Choose from 'power_supply', 'interference', 'clock_leakage'")
