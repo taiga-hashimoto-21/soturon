@@ -69,7 +69,9 @@ def add_structured_noise(psd_data, clip_range=0.5, smoothing_factor=0.1):
 # パラメータ設定（畳み込みと同じ）
 NUM_INTERVALS = 30
 NOISE_LEVEL = 0.3
-NOISE_TYPE = 'frequency_band'
+NOISE_TYPE = 'power_supply'  # 'power_supply', 'interference', 'clock_leakage' から選択（USE_RANDOM_NOISE=Falseの場合のみ使用）
+NOISE_TYPES = ['power_supply', 'interference', 'clock_leakage']
+USE_RANDOM_NOISE = True  # Trueにするとランダムに選択（推奨：学習データの多様性向上）
 ADD_STRUCTURED_NOISE = True
 STRUCTURED_NOISE_CLIP_RANGE = 0.5
 STRUCTURED_NOISE_SMOOTHING_FACTOR = 0.1
@@ -85,7 +87,10 @@ print("=" * 60)
 print("SSL用固定データセットの準備")
 print("=" * 60)
 print(f"区間数: {NUM_INTERVALS}")
-print(f"ノイズタイプ: {NOISE_TYPE}")
+if USE_RANDOM_NOISE:
+    print(f"ノイズタイプ: ランダム（power_supply, interference, clock_leakage）")
+else:
+    print(f"ノイズタイプ: {NOISE_TYPE}")
 print(f"ノイズレベル: {NOISE_LEVEL}")
 print(f"構造化ノイズ: {ADD_STRUCTURED_NOISE}")
 print(f"マスク比率: {MASK_RATIO}")
@@ -123,14 +128,43 @@ for i in range(num_samples):
     else:
         structured_noisy_psd = original_psd_tensor
     
-    # 2. ランダムに1つの区間を選ぶ（ノイズを付与する区間）
-    noise_interval = random.randint(0, NUM_INTERVALS - 1)
+    # 2. ノイズタイプを選択（ランダムまたは固定）
+    if USE_RANDOM_NOISE:
+        selected_noise_type = random.choice(NOISE_TYPES)
+    else:
+        selected_noise_type = NOISE_TYPE
     
-    # 3. 区間ノイズを付与
+    # 3. ノイズタイプに応じて、主要な周波数を決定
+    # 周波数範囲: 0-15000Hz, 3000ポイント → 1ポイント = 5Hz
+    # 30区間、1区間 = 100ポイント = 500Hz
+    freq_min = 0.0
+    freq_max = 15000.0
+    num_points = 3000
+    points_per_interval = num_points // NUM_INTERVALS  # 100ポイント
+    
+    if selected_noise_type == 'power_supply':
+        # 電源ノイズ: 2kHzのスイッチングノイズが最も目立つ
+        main_freq = 2000.0
+    elif selected_noise_type == 'interference':
+        # 干渉ノイズ: 3000Hz
+        main_freq = 3000.0
+    elif selected_noise_type == 'clock_leakage':
+        # クロックリークノイズ: 5000Hz
+        main_freq = 5000.0
+    else:
+        # デフォルト（念のため）
+        main_freq = 1000.0
+    
+    # 4. 周波数から区間インデックスを計算
+    freq_to_point = main_freq / (freq_max / num_points)
+    point_idx = int(freq_to_point)
+    noise_interval = min(point_idx // points_per_interval, NUM_INTERVALS - 1)
+    
+    # 5. 区間ノイズを付与
     noisy_psd_tensor, start_idx, end_idx = add_noise_to_interval(
         structured_noisy_psd,
         noise_interval,
-        noise_type=NOISE_TYPE,
+        noise_type=selected_noise_type,
         noise_level=NOISE_LEVEL,
         num_intervals=NUM_INTERVALS
     )
@@ -240,6 +274,8 @@ dataset = {
     'config': {
         'num_intervals': NUM_INTERVALS,
         'noise_type': NOISE_TYPE,
+        'use_random_noise': USE_RANDOM_NOISE,
+        'noise_types': NOISE_TYPES,
         'noise_level': NOISE_LEVEL,
         'add_structured_noise': ADD_STRUCTURED_NOISE,
         'structured_noise_clip_range': STRUCTURED_NOISE_CLIP_RANGE,

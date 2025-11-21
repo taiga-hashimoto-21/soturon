@@ -576,3 +576,204 @@ class SimpleCNN(nn.Module):
     def forward(self, x):
         return self.model(x)
 
+
+class NoiseDetectionAndReconstructionModel(nn.Module):
+    """
+    ノイズ検出 + 復元モデル（改善版）
+    - マスク予測: どの区間にノイズがあるか（30区間のノイズ強度）
+    - 復元: 周辺区間の情報を使ってノイズ区間を復元（3000ポイント）
+    """
+    
+    def __init__(self, num_intervals=30, points_per_interval=100, dropout_rate=0.3):
+        super(NoiseDetectionAndReconstructionModel, self).__init__()
+        
+        self.num_intervals = num_intervals
+        self.points_per_interval = points_per_interval
+        
+        # Encoder部分（既存のSimpleResNet1Dの特徴抽出部分を再利用）
+        self.conv1 = nn.Conv1d(1, 64, kernel_size=7, stride=2, padding=3)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.relu = nn.ReLU()
+        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        
+        # 残差ブロック層
+        self.layer1 = self._make_layer(64, 64, 2)
+        self.layer2 = self._make_layer(64, 128, 2, stride=2)
+        
+        # 区間ごとの特徴を抽出（30区間）
+        self.adaptive_pool = nn.AdaptiveAvgPool1d(num_intervals)
+        
+        # 共有特徴量（Encoderの出力）
+        self.shared_features_dim = 128 * num_intervals
+        self.interval_feature_dim = 128  # 各区間の特徴次元
+        
+        # Mask Head: ノイズマスク予測（30区間のノイズ強度）
+        self.mask_fc1 = nn.Linear(self.shared_features_dim, 256)
+        self.mask_dropout1 = nn.Dropout(dropout_rate)
+        self.mask_fc2 = nn.Linear(256, 128)
+        self.mask_dropout2 = nn.Dropout(dropout_rate)
+        self.mask_fc3 = nn.Linear(128, num_intervals)  # 各区間のノイズ強度
+        self.mask_sigmoid = nn.Sigmoid()  # 0-1に正規化
+        
+        # アテンション機構: 周辺区間から情報を集約
+        self.attention = nn.MultiheadAttention(
+            embed_dim=self.interval_feature_dim,
+            num_heads=8,
+            dropout=dropout_rate,
+            batch_first=False
+        )
+        
+        # 区間レベルの特徴抽出（各区間の100点から特徴を抽出）
+        self.interval_encoder = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=5, padding=2),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1)  # (batch_size, 64, 1)
+        )
+        
+        # 復元用デコーダー（区間ごとに復元）
+        self.interval_decoder = nn.Sequential(
+            nn.Linear(self.interval_feature_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, points_per_interval)  # 100点を復元
+        )
+        
+        # 全体の復元（区間を結合）
+        self.final_reconstruction = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=7, padding=3),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Conv1d(32, 16, kernel_size=5, padding=2),
+            nn.BatchNorm1d(16),
+            nn.ReLU(),
+            nn.Conv1d(16, 1, kernel_size=3, padding=1)
+        )
+        
+    def _make_layer(self, in_channels, out_channels, blocks, stride=1):
+        downsample = None
+        if stride != 1 or in_channels != out_channels:
+            downsample = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, 1, stride),
+                nn.BatchNorm1d(out_channels)
+            )
+        
+        layers = []
+        layers.append(ResidualBlock1D(in_channels, out_channels, stride=stride, downsample=downsample, use_gem=False))
+        for _ in range(1, blocks):
+            layers.append(ResidualBlock1D(out_channels, out_channels, use_gem=False))
+        
+        return nn.Sequential(*layers)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: ノイズ付きPSDデータ (batch_size, 3000)
+        
+        Returns:
+            mask: ノイズマスク (batch_size, 30) - 各区間のノイズ強度
+            reconstructed_interval: 復元された区間 (batch_size, 100) - 予測した区間のみ
+        """
+        batch_size = x.size(0)
+        
+        # ===== 1. Encoder部分: 全体の特徴抽出 =====
+        x_conv = x.unsqueeze(1)  # (batch_size, 1, 3000)
+        
+        x_conv = self.conv1(x_conv)
+        x_conv = self.bn1(x_conv)
+        x_conv = self.relu(x_conv)
+        x_conv = self.maxpool(x_conv)  # (batch_size, 64, 750)
+        
+        x_conv = self.layer1(x_conv)  # (batch_size, 64, 750)
+        x_conv = self.layer2(x_conv)  # (batch_size, 128, 375)
+        
+        # 区間ごとの特徴を抽出
+        interval_features_conv = self.adaptive_pool(x_conv)  # (batch_size, 128, 30)
+        
+        # フラット化（マスク予測用）
+        shared_features = interval_features_conv.view(batch_size, -1)  # (batch_size, 128 * 30)
+        
+        # ===== 2. Mask Head: ノイズマスク予測 =====
+        mask = self.mask_fc1(shared_features)
+        mask = self.relu(mask)
+        mask = self.mask_dropout1(mask)
+        
+        mask = self.mask_fc2(mask)
+        mask = self.relu(mask)
+        mask = self.mask_dropout2(mask)
+        
+        mask = self.mask_fc3(mask)  # (batch_size, 30)
+        mask = self.mask_sigmoid(mask)  # 0-1に正規化
+        
+        # ===== 3. 区間ごとの特徴抽出（100点から） =====
+        # 30区間に分割
+        intervals = x.view(batch_size, self.num_intervals, self.points_per_interval)  # (batch_size, 30, 100)
+        
+        # 各区間の特徴を抽出
+        interval_features_list = []
+        for i in range(self.num_intervals):
+            interval = intervals[:, i, :].unsqueeze(1)  # (batch_size, 1, 100)
+            interval_feat = self.interval_encoder(interval)  # (batch_size, 64, 1)
+            interval_feat = interval_feat.squeeze(-1)  # (batch_size, 64)
+            interval_features_list.append(interval_feat)
+        
+        interval_features = torch.stack(interval_features_list, dim=1)  # (batch_size, 30, 64)
+        
+        # 128次元に拡張（conv特徴と結合）
+        interval_features_conv_permuted = interval_features_conv.permute(0, 2, 1)  # (batch_size, 30, 128)
+        interval_features = torch.cat([interval_features, interval_features_conv_permuted], dim=2)  # (batch_size, 30, 192)
+        
+        # 128次元に投影
+        interval_features = interval_features[:, :, :self.interval_feature_dim]  # (batch_size, 30, 128)
+        
+        # ===== 4. アテンション機構: 周辺区間から情報を集約 =====
+        # ノイズ区間をマスクして、周辺区間から情報を集約
+        # (seq_len, batch_size, embed_dim) に変換（MultiheadAttention用）
+        interval_features_transposed = interval_features.permute(1, 0, 2)  # (30, batch_size, 128)
+        
+        # アテンション: 各区間が他の区間から情報を集約
+        attended_features, attention_weights = self.attention(
+            interval_features_transposed,
+            interval_features_transposed,
+            interval_features_transposed
+        )  # (30, batch_size, 128)
+        
+        attended_features = attended_features.permute(1, 0, 2)  # (batch_size, 30, 128)
+        
+        # ノイズ区間の特徴を周辺区間の情報で置き換え
+        mask_expanded = mask.unsqueeze(-1)  # (batch_size, 30, 1)
+        # ノイズ区間: アテンション後の特徴を使用
+        # 正常区間: 元の特徴を使用（ノイズがないのでそのまま）
+        reconstructed_interval_features = (
+            mask_expanded * attended_features + 
+            (1 - mask_expanded) * interval_features
+        )
+        
+        # ===== 5. 予測した区間だけを復元（効率化） =====
+        # 最も確信度の高い区間（予測区間）だけを復元
+        predicted_intervals = mask.argmax(dim=1)  # (batch_size,) - 予測された区間
+        
+        # 予測した区間の特徴を取得して復元
+        reconstructed_intervals_list = []
+        for i in range(batch_size):
+            predicted_interval = predicted_intervals[i].item()
+            interval_feat = reconstructed_interval_features[i, predicted_interval, :]  # (128,)
+            reconstructed_interval = self.interval_decoder(interval_feat.unsqueeze(0))  # (1, 100)
+            reconstructed_intervals_list.append(reconstructed_interval.squeeze(0))  # (100,)
+        
+        # バッチごとに予測した区間の復元結果を結合
+        reconstructed_intervals = torch.stack(reconstructed_intervals_list, dim=0)  # (batch_size, 100)
+        
+        # 最終的な平滑化（オプション）
+        reconstructed_intervals = reconstructed_intervals.unsqueeze(1)  # (batch_size, 1, 100)
+        reconstructed_intervals = self.final_reconstruction(reconstructed_intervals)  # (batch_size, 1, 100)
+        reconstructed_intervals = reconstructed_intervals.squeeze(1)  # (batch_size, 100)
+        
+        return mask, reconstructed_intervals  # (batch_size, 30), (batch_size, 100)
+

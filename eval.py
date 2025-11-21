@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
 import matplotlib.pyplot as plt
@@ -74,12 +75,22 @@ def evaluate_baseline_model(model, dataloader, device='cuda', num_intervals=30):
     f1 = f1_score(all_labels, all_predictions, average='macro', zero_division=0)
     cm = confusion_matrix(all_labels, all_predictions)
     
+    # 復元損失: baselineモデルは復元タスクをしていないため、Noneを返す
+    reconstruction_loss = None
+    
+    # 主要な損失: 復元損失が最も重要だが、baselineモデルは復元タスクをしていない
+    # そのため、マスク予測の損失（CrossEntropyLoss）を返す
+    # ただし、復元損失が利用可能な場合はそれを優先する
+    primary_loss = reconstruction_loss if reconstruction_loss is not None else evaluation_loss
+    
     return {
         'accuracy': accuracy,
         'precision': precision,
         'recall': recall,
         'f1_score': f1,
-        'loss': evaluation_loss,  # CrossEntropyLoss
+        'loss': primary_loss,  # 復元損失が利用可能な場合は復元損失、そうでなければマスク予測損失
+        'reconstruction_loss': reconstruction_loss,  # 復元損失（baselineモデルではNone）
+        'mask_evaluation_loss': evaluation_loss,  # CrossEntropyLoss（マスク予測の損失）
         'confusion_matrix': cm,
         'predictions': all_predictions,
         'labels': all_labels,
@@ -283,13 +294,46 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
     except:
         roc_auc = 0.0
     
+    # 復元損失を計算（マスクされた部分の復元精度）
+    # データローダーを再度ループして復元損失を計算
+    model.eval()
+    all_reconstruction_losses = []
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            x = batch['input'].to(device)  # マスクされたデータ
+            target = batch['target'].to(device)  # ノイズ付きデータ（マスクなし、復元目標）
+            mask = batch['mask'].to(device)  # マスク位置
+            
+            # モデルの出力（マスク予測）
+            predictions, _ = model(x, mask, return_attention=False)
+            # predictions: (B, L) - 予測されたPSDデータ
+            
+            # マスクされた部分の復元損失を計算
+            if mask.any():
+                # マスクされた部分のみでMSE損失を計算
+                mask_loss = F.mse_loss(predictions[mask], target[mask])
+                all_reconstruction_losses.append(mask_loss.item())
+    
+    # 復元損失の平均
+    if len(all_reconstruction_losses) > 0:
+        reconstruction_loss = np.mean(all_reconstruction_losses)
+    else:
+        reconstruction_loss = None
+    
+    # 主要な損失: 復元損失（MSE損失）
+    # 復元損失が最も重要なので、'loss'キーに復元損失を設定
+    primary_loss = reconstruction_loss if reconstruction_loss is not None else float('inf')
+    
     return {
         'accuracy': accuracy,
         'precision': precision,
         'recall': recall,
         'f1_score': f1,
         'roc_auc': roc_auc,
-        'loss': evaluation_loss,  # baselineと同じCrossEntropyLoss
+        'loss': primary_loss,  # 復元損失（MSE損失）- 最も重要な指標
+        'reconstruction_loss': reconstruction_loss,  # 復元損失（明示的に）
+        'mask_evaluation_loss': evaluation_loss,  # CrossEntropyLoss（マスク予測の損失）
         'attention_diff': attention_diff,
         'best_threshold': best_threshold,
         'confusion_matrix': cm,
@@ -380,6 +424,160 @@ def plot_attention_distribution(attention_weights, labels, num_intervals=30, sav
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
+
+
+def evaluate_noise_detection_reconstruction_model(
+    model, dataloader, device='cuda', num_intervals=30, points_per_interval=100
+):
+    """
+    ノイズ検出 + 復元モデルの評価
+    
+    評価項目:
+    1. マスク予測精度（どの区間にノイズがあるか）
+    2. 復元精度（真のノイズ区間のみで評価）
+    
+    Args:
+        model: ノイズ検出 + 復元モデル（NoiseDetectionAndReconstructionModel）
+        dataloader: データローダー
+        device: デバイス
+        num_intervals: 区間数（デフォルト: 30）
+        points_per_interval: 1区間あたりのポイント数（デフォルト: 100）
+    
+    Returns:
+        dict: 評価指標の辞書
+    """
+    model.eval()
+    
+    all_mask_predictions = []
+    all_mask_labels = []
+    all_reconstruction_losses = []
+    all_reconstruction_accuracies = []  # 復元精度（%）
+    all_mask_correct = []
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            if isinstance(batch, dict):
+                noisy_psd = batch['noisy_psd'].to(device)
+                original_psd = batch['original_psd'].to(device)  # ノイズ付与前
+                true_noise_intervals = batch['noise_intervals'].to(device)  # 真のノイズ区間
+            else:
+                # タプルの場合: (noisy_psd, original_psd, true_noise_intervals)
+                noisy_psd, original_psd, true_noise_intervals = batch
+                noisy_psd = noisy_psd.to(device)
+                original_psd = original_psd.to(device)
+                true_noise_intervals = true_noise_intervals.to(device)
+            
+            # モデルの出力
+            predicted_mask, reconstructed_interval = model(noisy_psd)
+            # predicted_mask: (batch_size, 30) - 各区間のノイズ強度
+            # reconstructed_interval: (batch_size, 100) - 予測した区間のみ復元
+            
+            batch_size = noisy_psd.size(0)
+            
+            # 1. マスク予測の評価
+            # 予測された区間（最も確信度の高い区間）
+            predicted_intervals = predicted_mask.argmax(dim=1)  # (batch_size,)
+            
+            # マスク予測が正しいかチェック
+            for i in range(batch_size):
+                pred_interval = predicted_intervals[i].item()
+                true_interval = true_noise_intervals[i].item()
+                is_correct = (pred_interval == true_interval)
+                all_mask_correct.append(is_correct)
+                
+                all_mask_predictions.append(pred_interval)
+                all_mask_labels.append(true_interval)
+            
+            # 2. 復元精度の評価
+            # reconstructed_intervalは予測した区間のみ（100ポイント）
+            for i in range(batch_size):
+                pred_interval = predicted_intervals[i].item()
+                true_interval = true_noise_intervals[i].item()
+                
+                # 予測した区間が真のノイズ区間と一致する場合のみ復元損失を計算
+                if pred_interval == true_interval:
+                    # 真のノイズ区間のインデックス範囲を計算
+                    start_idx = true_interval * points_per_interval
+                    end_idx = min(start_idx + points_per_interval, original_psd.size(1))
+                    
+                    # 予測した区間の復元精度を計算
+                    pred_interval_reconstructed = reconstructed_interval[i]  # (100,)
+                    true_interval_original = original_psd[i, start_idx:end_idx]  # (100,)
+                    
+                    # MSE損失
+                    interval_loss = F.mse_loss(pred_interval_reconstructed, true_interval_original)
+                    all_reconstruction_losses.append(interval_loss.item())
+                    
+                    # 復元精度（%）を計算
+                    # 相対誤差から復元精度を計算: accuracy = (1 - relative_error) * 100
+                    relative_error = torch.abs(pred_interval_reconstructed - true_interval_original) / (
+                        torch.abs(true_interval_original) + 1e-8
+                    )
+                    relative_error_mean = relative_error.mean().item()
+                    reconstruction_accuracy = max(0.0, (1.0 - relative_error_mean) * 100.0)
+                    all_reconstruction_accuracies.append(reconstruction_accuracy)
+                # 予測が間違っている場合は復元損失を計算しない（アプローチ2に従う）
+    
+    # 評価指標の計算
+    all_mask_predictions = np.array(all_mask_predictions)
+    all_mask_labels = np.array(all_mask_labels)
+    
+    # 1. マスク予測精度
+    mask_accuracy = accuracy_score(all_mask_labels, all_mask_predictions)
+    mask_precision = precision_score(all_mask_labels, all_mask_predictions, average='macro', zero_division=0)
+    mask_recall = recall_score(all_mask_labels, all_mask_predictions, average='macro', zero_division=0)
+    mask_f1 = f1_score(all_mask_labels, all_mask_predictions, average='macro', zero_division=0)
+    mask_cm = confusion_matrix(all_mask_labels, all_mask_predictions)
+    
+    # 2. 復元精度（マスク予測が正しい場合のみ）
+    # all_reconstruction_lossesには、マスク予測が正しい場合のみ復元損失が含まれる
+    if len(all_reconstruction_losses) > 0:
+        overall_reconstruction_loss = np.mean(all_reconstruction_losses)
+        overall_reconstruction_accuracy = np.mean(all_reconstruction_accuracies)  # 平均復元精度（%）
+    else:
+        overall_reconstruction_loss = None
+        overall_reconstruction_accuracy = None
+    
+    # マスク予測が正しい場合と間違った場合の復元精度
+    correct_indices = [i for i, correct in enumerate(all_mask_correct) if correct]
+    incorrect_indices = [i for i, correct in enumerate(all_mask_correct) if not correct]
+    
+    if len(correct_indices) > 0 and len(all_reconstruction_losses) > 0:
+        # all_reconstruction_lossesのインデックスは、マスク予測が正しいサンプルのみに対応
+        reconstruction_loss_when_correct = overall_reconstruction_loss
+    else:
+        reconstruction_loss_when_correct = None
+    
+    # マスク予測が間違った場合は復元損失を計算しない（アプローチ2）
+    reconstruction_loss_when_incorrect = None
+    
+    # 3. 主要な損失: 復元損失（MSE損失）
+    # 復元損失が最も重要なので、'loss'キーに復元損失を設定
+    # マスク予測が正しい場合のみ復元損失を計算（アプローチ2）
+    primary_loss = overall_reconstruction_loss if overall_reconstruction_loss is not None else float('inf')
+    
+    return {
+        'accuracy': mask_accuracy,  # baseline/self_supervisedと共通のキー名
+        'precision': mask_precision,  # baseline/self_supervisedと共通のキー名
+        'recall': mask_recall,  # baseline/self_supervisedと共通のキー名
+        'f1_score': mask_f1,  # baseline/self_supervisedと共通のキー名
+        'loss': primary_loss,  # 復元損失（MSE損失）- 最も重要な指標
+        'mask_accuracy': mask_accuracy,  # 後方互換性のため残す
+        'mask_precision': mask_precision,
+        'mask_recall': mask_recall,
+        'mask_f1_score': mask_f1,
+        'mask_confusion_matrix': mask_cm,
+        'overall_reconstruction_loss': overall_reconstruction_loss,  # 復元損失（MSE損失）
+        'reconstruction_accuracy': overall_reconstruction_accuracy,  # 復元精度（%）
+        'reconstruction_loss_when_correct': reconstruction_loss_when_correct,
+        'reconstruction_loss_when_incorrect': reconstruction_loss_when_incorrect,
+        'num_correct_masks': len(correct_indices),
+        'num_incorrect_masks': len(incorrect_indices),
+        'predictions': all_mask_predictions,
+        'labels': all_mask_labels,
+        'reconstruction_losses': all_reconstruction_losses,
+        'reconstruction_accuracies': all_reconstruction_accuracies,  # 各サンプルの復元精度（%）
+    }
 
 
 def compare_methods(baseline_results, ssl_results):

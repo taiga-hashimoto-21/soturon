@@ -215,7 +215,8 @@ def train_task4(
     resume=True,
     lambda_reg=0.1,
     num_intervals=30,
-    noise_type='frequency_band',
+    noise_type='power_supply',
+    use_random_noise=True,
     noise_level=0.3,  # ベースラインと合わせる（prepare_baseline_dataset.pyを確認）
     margin=0.1,
 ):
@@ -233,7 +234,8 @@ def train_task4(
         resume: チェックポイントから再開するか
         lambda_reg: 正則化項の重み
         num_intervals: 区間数
-        noise_type: ノイズタイプ（'frequency_band', 'localized_spike', 'amplitude_dependent'）
+        noise_type: ノイズタイプ（'power_supply', 'interference', 'clock_leakage'、use_random_noise=Falseの場合のみ使用）
+        use_random_noise: 3種類のノイズをランダムに使用するか（デフォルト: True）
         noise_level: ノイズレベル（デフォルト: 0.3）
         margin: ランキング損失のマージン（デフォルト: 0.1）
     """
@@ -247,6 +249,7 @@ def train_task4(
             pickle_path=pickle_path,
             num_intervals=num_intervals,
             noise_type=noise_type,
+            use_random_noise=use_random_noise,
             noise_level=noise_level,
             add_structured_noise_flag=True,  # 全体的な構造化ノイズを付与（実験データに近づけるため）
         )
@@ -497,7 +500,8 @@ if __name__ == "__main__":
         resume=True,
         lambda_reg=2.0,  # 0.1 → 2.0に変更（正則化項の重みを大きく）
         num_intervals=30,
-        noise_type='frequency_band',
+        noise_type='power_supply',
+        use_random_noise=True,
         noise_level=0.3,
         margin=0.01,  # 0.1 → 0.01に変更（学習が進みやすくする）
     )

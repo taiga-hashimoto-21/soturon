@@ -4,10 +4,10 @@
 統合インターフェースとして機能
 """
 
-# 相対インポートを絶対インポートに変更（Colab対応）
-from power_supply_noise import add_power_supply_noise
-from interference_noise import add_interference_noise
-from clock_leakage_noise import add_clock_leakage_noise
+# 相対インポート（同じディレクトリ内のモジュール）
+from .power_supply_noise import add_power_supply_noise
+from .interference_noise import add_interference_noise
+from .clock_leakage_noise import add_clock_leakage_noise
 
 
 def add_noise_to_interval(psd_data, interval_idx, noise_type='power_supply', **kwargs):

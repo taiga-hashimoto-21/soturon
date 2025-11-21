@@ -50,7 +50,8 @@ def debug_attention_weights(
     dataset = Task4Dataset(
         pickle_path=pickle_path,
         num_intervals=30,
-        noise_type='frequency_band',
+        noise_type='power_supply',
+        use_random_noise=True,
         noise_level=0.3,
         add_structured_noise_flag=True,
     )

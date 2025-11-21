@@ -102,8 +102,9 @@ class Task4Dataset(Dataset):
         pickle_path: str,
         num_intervals: int = 30,
         mask_ratio: float = 0.15,
-        noise_type: str = 'frequency_band',
+        noise_type: str = 'power_supply',
         noise_level: float = 0.3,
+        use_random_noise: bool = True,
         add_structured_noise_flag: bool = True,
         structured_noise_clip_range: float = 0.5,
         structured_noise_smoothing_factor: float = 0.1,
@@ -116,8 +117,9 @@ class Task4Dataset(Dataset):
             pickle_path: data_lowF_noise.pickleのパス（use_fixed_dataset=Falseの場合）
             num_intervals: 区間数（デフォルト: 30）
             mask_ratio: マスクする区間の割合（デフォルト: 0.15 = 15%）
-            noise_type: ノイズタイプ（'frequency_band', 'localized_spike', 'amplitude_dependent'）
+            noise_type: ノイズタイプ（'power_supply', 'interference', 'clock_leakage'、use_random_noise=Falseの場合のみ使用）
             noise_level: ノイズレベル（デフォルト: 0.3 = 30%）
+            use_random_noise: 3種類のノイズをランダムに使用するか（デフォルト: True）
             add_structured_noise_flag: 全体的な構造化ノイズを付与するか（デフォルト: True）
             structured_noise_clip_range: 構造化ノイズのクリッピング範囲（デフォルト: 0.5）
             structured_noise_smoothing_factor: 構造化ノイズのスムージング係数（デフォルト: 0.1）
@@ -132,6 +134,8 @@ class Task4Dataset(Dataset):
         self.mask_ratio = mask_ratio
         self.noise_type = noise_type
         self.noise_level = noise_level
+        self.use_random_noise = use_random_noise
+        self.noise_types = ['power_supply', 'interference', 'clock_leakage']
         self.add_structured_noise_flag = add_structured_noise_flag
         self.structured_noise_clip_range = structured_noise_clip_range
         self.structured_noise_smoothing_factor = structured_noise_smoothing_factor
@@ -211,7 +215,10 @@ class Task4Dataset(Dataset):
             print(f"  Sequence length: {self.seq_len}")
             print(f"  Intervals: {self.num_intervals}")
             print(f"  Points per interval: {self.points_per_interval}")
-            print(f"  Noise type: {self.noise_type}")
+            if self.use_random_noise:
+                print(f"  Noise type: Random ({', '.join(self.noise_types)})")
+            else:
+                print(f"  Noise type: {self.noise_type}")
             print(f"  Noise level: {self.noise_level}")
             print(f"  Add structured noise: {self.add_structured_noise_flag}")
             print(f"  Normalization mean: {self.normalization_mean:.6f}")
@@ -256,12 +263,42 @@ class Task4Dataset(Dataset):
             else:
                 structured_noisy_psd = base_psd_tensor
             
-            # 区間ノイズを付与（ランダムに1区間）
-            noise_interval = np.random.randint(0, self.num_intervals)
+            # ノイズタイプを選択（ランダムまたは固定）
+            if self.use_random_noise:
+                selected_noise_type = np.random.choice(self.noise_types)
+            else:
+                selected_noise_type = self.noise_type
+            
+            # ノイズタイプに応じて、主要な周波数を決定
+            # 周波数範囲: 0-15000Hz, 3000ポイント → 1ポイント = 5Hz
+            # 30区間、1区間 = 100ポイント = 500Hz
+            freq_min = 0.0
+            freq_max = 15000.0
+            num_points = self.seq_len
+            
+            if selected_noise_type == 'power_supply':
+                # 電源ノイズ: 2kHzのスイッチングノイズが最も目立つ
+                main_freq = 2000.0
+            elif selected_noise_type == 'interference':
+                # 干渉ノイズ: 3000Hz
+                main_freq = 3000.0
+            elif selected_noise_type == 'clock_leakage':
+                # クロックリークノイズ: 5000Hz
+                main_freq = 5000.0
+            else:
+                # デフォルト（念のため）
+                main_freq = 1000.0
+            
+            # 周波数から区間インデックスを計算
+            freq_to_point = main_freq / (freq_max / num_points)
+            point_idx = int(freq_to_point)
+            noise_interval = min(point_idx // self.points_per_interval, self.num_intervals - 1)
+            
+            # 区間ノイズを付与
             noisy_psd_tensor, _, _ = add_noise_to_interval(
                 structured_noisy_psd,
                 noise_interval,
-                noise_type=self.noise_type,
+                noise_type=selected_noise_type,
                 noise_level=self.noise_level,
                 num_intervals=self.num_intervals
             )
@@ -341,14 +378,42 @@ class Task4Dataset(Dataset):
         else:
             structured_noisy_psd = base_psd_tensor
         
-        # 2. ランダムに1つの区間を選ぶ（ノイズを付与する区間）
-        noise_interval = np.random.randint(0, self.num_intervals)
+        # 2. ノイズタイプを選択（ランダムまたは固定）
+        if self.use_random_noise:
+            selected_noise_type = np.random.choice(self.noise_types)
+        else:
+            selected_noise_type = self.noise_type
         
-        # 3. 区間ノイズを付与（ノイズ検知の対象）
+        # 3. ノイズタイプに応じて、主要な周波数を決定
+        # 周波数範囲: 0-15000Hz, 3000ポイント → 1ポイント = 5Hz
+        # 30区間、1区間 = 100ポイント = 500Hz
+        freq_min = 0.0
+        freq_max = 15000.0
+        num_points = L
+        
+        if selected_noise_type == 'power_supply':
+            # 電源ノイズ: 2kHzのスイッチングノイズが最も目立つ
+            main_freq = 2000.0
+        elif selected_noise_type == 'interference':
+            # 干渉ノイズ: 3000Hz
+            main_freq = 3000.0
+        elif selected_noise_type == 'clock_leakage':
+            # クロックリークノイズ: 5000Hz
+            main_freq = 5000.0
+        else:
+            # デフォルト（念のため）
+            main_freq = 1000.0
+        
+        # 4. 周波数から区間インデックスを計算
+        freq_to_point = main_freq / (freq_max / num_points)
+        point_idx = int(freq_to_point)
+        noise_interval = min(point_idx // self.points_per_interval, self.num_intervals - 1)
+        
+        # 5. 区間ノイズを付与（ノイズ検知の対象）
         noisy_psd_tensor, start_idx, end_idx = add_noise_to_interval(
             structured_noisy_psd,
             noise_interval,
-            noise_type=self.noise_type,
+            noise_type=selected_noise_type,
             noise_level=self.noise_level,
             num_intervals=self.num_intervals
         )
