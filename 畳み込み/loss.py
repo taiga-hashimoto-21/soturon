@@ -10,6 +10,7 @@ import torch.nn.functional as F
 def compute_noise_detection_reconstruction_loss(
     predicted_mask,
     reconstructed_interval,
+    reconstructed_intervals_info,
     true_mask,
     original_psd,
     noisy_psd,
@@ -24,7 +25,8 @@ def compute_noise_detection_reconstruction_loss(
     
     Args:
         predicted_mask: 予測されたノイズマスク (batch_size, 30) - 各区間のノイズ強度
-        reconstructed_interval: 復元された区間 (batch_size, 100) - 予測した区間のみ
+        reconstructed_interval: 復元された区間 (batch_size, max_length) - 予測区間±2区間（最大500ポイント）
+        reconstructed_intervals_info: 復元範囲の情報 (batch_size, 3) - [start_interval, end_interval, predicted_interval]
         true_mask: 真のノイズマスク (batch_size, 30) - 各区間のノイズ有無（0 or 1）
         original_psd: 元のPSDデータ（ノイズ付与前） (batch_size, 3000)
         noisy_psd: ノイズ付きPSDデータ (batch_size, 3000)
@@ -64,49 +66,64 @@ def compute_noise_detection_reconstruction_loss(
             num_correct_masks += 1
             
             # マスク予測が正しい場合のみ復元損失を計算
-            # 予測した区間（= 真のノイズ区間）の復元精度を評価
-            # reconstructed_intervalは既に予測した区間の100ポイントのみ
-            predicted_interval_reconstructed = reconstructed_interval[i]  # (100,)
+            # 予測区間±2区間（合計5区間）の復元精度を評価
+            # 復元範囲の情報を取得
+            start_interval = reconstructed_intervals_info[i, 0].item()
+            end_interval = reconstructed_intervals_info[i, 1].item()
             
-            # 真のノイズ区間の元のデータを取得
-            start_idx = true_noise_interval * points_per_interval
-            end_idx = min(start_idx + points_per_interval, original_psd.size(1))
-            predicted_interval_original = original_psd[i, start_idx:end_idx]  # (100,)
+            # 復元されたデータを取得（パディングを除く）
+            num_intervals_reconstructed = end_interval - start_interval + 1
+            reconstructed_length = num_intervals_reconstructed * points_per_interval
+            pred_reconstructed = reconstructed_interval[i, :reconstructed_length]  # (reconstructed_length,)
+            
+            # 正解データも同じ範囲を取得
+            true_start_idx = start_interval * points_per_interval
+            true_end_idx = min((end_interval + 1) * points_per_interval, original_psd.size(1))
+            true_original = original_psd[i, true_start_idx:true_end_idx]  # (reconstructed_length,)
+            
+            # 長さが一致することを確認
+            min_length = min(pred_reconstructed.shape[0], true_original.shape[0])
+            pred_reconstructed = pred_reconstructed[:min_length]
+            true_original = true_original[:min_length]
             
             # (a) MSE損失（基本的な復元精度）
-            mse_loss = F.mse_loss(predicted_interval_reconstructed, predicted_interval_original)
+            mse_loss = F.mse_loss(pred_reconstructed, true_original)
             reconstruction_losses.append(mse_loss)
             
             # (b) 相対誤差（大きな値と小さな値の両方で精度を評価）
-            relative_error = torch.abs(predicted_interval_reconstructed - predicted_interval_original) / (
-                torch.abs(predicted_interval_original) + 1e-8
+            relative_error = torch.abs(pred_reconstructed - true_original) / (
+                torch.abs(true_original) + 1e-8
             )
             relative_loss = relative_error.mean()
             relative_losses.append(relative_loss)
             
             # (c) 平滑性損失（周辺区間との連続性を保つ）
-            if predicted_interval > 0 and predicted_interval < num_intervals - 1:
-                # 前後の区間との境界での連続性
-                prev_end = predicted_interval * points_per_interval - 1
-                next_start = (predicted_interval + 1) * points_per_interval
-                
-                if prev_end >= 0 and next_start < original_psd.size(1):
-                    # 前の区間の最後の点とノイズ区間の最初の点
+            # 復元範囲の前後の区間との境界での連続性
+            if start_interval > 0:
+                prev_end = start_interval * points_per_interval - 1
+                if prev_end >= 0:
                     boundary_loss_prev = F.mse_loss(
-                        predicted_interval_reconstructed[0:1],
+                        pred_reconstructed[0:1],
                         noisy_psd[i, prev_end:prev_end+1]  # ノイズ付きデータの前の区間
                     )
-                    # ノイズ区間の最後の点と次の区間の最初の点
+                else:
+                    boundary_loss_prev = torch.tensor(0.0, device=original_psd.device)
+            else:
+                boundary_loss_prev = torch.tensor(0.0, device=original_psd.device)
+            
+            if end_interval < num_intervals - 1:
+                next_start = (end_interval + 1) * points_per_interval
+                if next_start < original_psd.size(1):
                     boundary_loss_next = F.mse_loss(
-                        predicted_interval_reconstructed[-1:],
+                        pred_reconstructed[-1:],
                         noisy_psd[i, next_start:next_start+1]  # ノイズ付きデータの次の区間
                     )
-                    smoothness_loss = (boundary_loss_prev + boundary_loss_next) / 2
                 else:
-                    smoothness_loss = torch.tensor(0.0, device=original_psd.device)
+                    boundary_loss_next = torch.tensor(0.0, device=original_psd.device)
             else:
-                smoothness_loss = torch.tensor(0.0, device=original_psd.device)
+                boundary_loss_next = torch.tensor(0.0, device=original_psd.device)
             
+            smoothness_loss = (boundary_loss_prev + boundary_loss_next) / 2
             smoothness_losses.append(smoothness_loss)
     
     # マスク予測が正しいサンプルのみで復元損失を計算

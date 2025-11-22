@@ -351,11 +351,16 @@ class Task4Dataset(Dataset):
             
             # 固定データセットには元のデータがないため、targetを元のデータとして使用
             # （固定データセットは評価用なので、復元損失は計算しない）
+            # ノイズ強度も計算できないため、ダミー値を返す（評価時は使用しない）
+            dummy_noise_strength = torch.zeros(self.num_intervals, dtype=torch.float32)
+            dummy_noise_strength[noise_interval] = 1.0  # ノイズ区間のみ1.0
+            
             return {
                 'input': torch.tensor(masked_noisy_psd_norm, dtype=torch.float32),
                 'target': torch.tensor(noisy_psd_norm, dtype=torch.float32),
                 'mask': torch.tensor(mask_positions, dtype=torch.bool),
                 'noise_interval': torch.tensor(noise_interval, dtype=torch.long),
+                'noise_strength': dummy_noise_strength,  # ダミー値（評価時は使用しない）
                 'original': None,  # 固定データセットでは元のデータは利用不可
             }
         
@@ -413,16 +418,44 @@ class Task4Dataset(Dataset):
         noise_interval = min(point_idx // self.points_per_interval, self.num_intervals - 1)
         
         # 5. 区間ノイズを付与（ノイズ検知の対象）
-        noisy_psd_tensor, start_idx, end_idx = add_noise_to_interval(
-            structured_noisy_psd,
+        # ノイズ強度の計算のため、スケールファクターを適用したデータでノイズを付与
+        # （ノイズ関数はpsd_data.mean()を使用するため、スケールされたデータで計算する必要がある）
+        scaled_structured_noisy_psd = structured_noisy_psd * self.scale_factor
+        scaled_noisy_psd_tensor, start_idx, end_idx = add_noise_to_interval(
+            scaled_structured_noisy_psd,
             noise_interval,
             noise_type=selected_noise_type,
             noise_level=self.noise_level,
             num_intervals=self.num_intervals
         )
         
-        # numpy配列に戻す
+        # ノイズ強度の計算はスケールされたデータで行う（数値精度の問題を避けるため）
+        scaled_noisy_psd = scaled_noisy_psd_tensor.numpy()
+        scaled_structured_noisy_psd_np = scaled_structured_noisy_psd.numpy()
+        noise_diff = scaled_noisy_psd - scaled_structured_noisy_psd_np  # (L,) 区間ノイズのみの差分（スケール済み）
+        
+        # スケールを戻す（学習用のデータ）
+        noisy_psd_tensor = scaled_noisy_psd_tensor / self.scale_factor
         noisy_psd = noisy_psd_tensor.numpy()
+        
+        # 各区間のノイズ強度を計算
+        noise_strength_per_interval = []
+        for i in range(self.num_intervals):
+            start_idx = i * self.points_per_interval
+            end_idx = min(start_idx + self.points_per_interval, L)
+            interval_noise = noise_diff[start_idx:end_idx]
+            # ノイズ強度 = 差分の絶対値の平均（またはRMS）
+            noise_strength = np.abs(interval_noise).mean()
+            noise_strength_per_interval.append(noise_strength)
+        
+        # 正規化（合計=1）
+        noise_strength_per_interval = np.array(noise_strength_per_interval, dtype=np.float32)
+        total_strength = noise_strength_per_interval.sum()
+        if total_strength > 1e-10:  # ゼロ除算を防ぐ
+            normalized_noise_strength = noise_strength_per_interval / total_strength
+        else:
+            # ノイズがほとんどない場合は均等に
+            normalized_noise_strength = np.ones(self.num_intervals, dtype=np.float32) / self.num_intervals
         
         # マスク位置を決定（15%の区間をランダムにマスク、ノイズ区間は除外）
         # ノイズ区間以外の区間から選択
@@ -481,6 +514,7 @@ class Task4Dataset(Dataset):
             'target': torch.tensor(noisy_psd_norm, dtype=torch.float32),
             'mask': torch.tensor(mask_positions, dtype=torch.bool),
             'noise_interval': torch.tensor(noise_interval, dtype=torch.long),
+            'noise_strength': torch.tensor(normalized_noise_strength, dtype=torch.float32),  # 各區間のノイズ強度（正規化済み）
             'original': torch.tensor(original_psd_norm, dtype=torch.float32),  # 元のデータ（ノイズ付与前）
         }
 

@@ -678,7 +678,8 @@ class NoiseDetectionAndReconstructionModel(nn.Module):
         
         Returns:
             mask: ノイズマスク (batch_size, 30) - 各区間のノイズ強度
-            reconstructed_interval: 復元された区間 (batch_size, 100) - 予測した区間のみ
+            reconstructed_intervals: 復元された区間 (batch_size, max_length) - 予測区間±2区間（最大500ポイント）
+            reconstructed_intervals_info: 復元範囲の情報 (batch_size, 3) - [start_interval, end_interval, predicted_interval]
         """
         batch_size = x.size(0)
         
@@ -755,25 +756,75 @@ class NoiseDetectionAndReconstructionModel(nn.Module):
             (1 - mask_expanded) * interval_features
         )
         
-        # ===== 5. 予測した区間だけを復元（効率化） =====
-        # 最も確信度の高い区間（予測区間）だけを復元
+        # ===== 5. 予測した区間±2区間（合計5区間）を復元 =====
+        # 最も確信度の高い区間（予測区間）を中心に、左右2区間ずつ復元
         predicted_intervals = mask.argmax(dim=1)  # (batch_size,) - 予測された区間
+        window_size = 2  # 左右に2区間ずつ
         
-        # 予測した区間の特徴を取得して復元
         reconstructed_intervals_list = []
+        reconstructed_intervals_info_list = []
+        
         for i in range(batch_size):
             predicted_interval = predicted_intervals[i].item()
-            interval_feat = reconstructed_interval_features[i, predicted_interval, :]  # (128,)
-            reconstructed_interval = self.interval_decoder(interval_feat.unsqueeze(0))  # (1, 100)
-            reconstructed_intervals_list.append(reconstructed_interval.squeeze(0))  # (100,)
+            
+            # 復元する区間の範囲を決定（予測区間±2区間）
+            start_interval = max(0, predicted_interval - window_size)
+            end_interval = min(self.num_intervals - 1, predicted_interval + window_size)
+            num_intervals_to_reconstruct = end_interval - start_interval + 1
+            
+            # 5区間分の特徴を取得して復元
+            reconstructed_parts = []
+            for interval_idx in range(start_interval, end_interval + 1):
+                interval_feat = reconstructed_interval_features[i, interval_idx, :]  # (128,)
+                reconstructed_interval_single = self.interval_decoder(interval_feat.unsqueeze(0))  # (1, 100)
+                reconstructed_parts.append(reconstructed_interval_single.squeeze(0))  # (100,)
+            
+            # 5区間分を結合（合計500ポイント）
+            reconstructed_combined = torch.cat(reconstructed_parts, dim=0)  # (num_intervals_to_reconstruct * 100,)
+            reconstructed_intervals_list.append(reconstructed_combined)
+            
+            # 復元範囲の情報を保存
+            reconstructed_intervals_info_list.append(torch.tensor([
+                start_interval,
+                end_interval,
+                predicted_interval
+            ], device=x.device, dtype=torch.long))
         
-        # バッチごとに予測した区間の復元結果を結合
-        reconstructed_intervals = torch.stack(reconstructed_intervals_list, dim=0)  # (batch_size, 100)
+        # バッチごとに異なる長さになる可能性があるため、最大長に合わせてパディング
+        max_length = max(r.shape[0] for r in reconstructed_intervals_list)
+        padded_reconstructed = []
+        
+        for i, r in enumerate(reconstructed_intervals_list):
+            if r.shape[0] < max_length:
+                # パディング（最後に0を追加）
+                padding = torch.zeros(max_length - r.shape[0], device=r.device, dtype=r.dtype)
+                r = torch.cat([r, padding], dim=0)
+            padded_reconstructed.append(r)
+        
+        reconstructed_intervals = torch.stack(padded_reconstructed, dim=0)  # (batch_size, max_length)
+        reconstructed_intervals_info = torch.stack(reconstructed_intervals_info_list, dim=0)  # (batch_size, 3)
         
         # 最終的な平滑化（オプション）
-        reconstructed_intervals = reconstructed_intervals.unsqueeze(1)  # (batch_size, 1, 100)
-        reconstructed_intervals = self.final_reconstruction(reconstructed_intervals)  # (batch_size, 1, 100)
-        reconstructed_intervals = reconstructed_intervals.squeeze(1)  # (batch_size, 100)
+        # 各サンプルごとに平滑化を適用（可変長のため）
+        smoothed_intervals = []
+        for i in range(batch_size):
+            start_interval = reconstructed_intervals_info[i, 0].item()
+            end_interval = reconstructed_intervals_info[i, 1].item()
+            num_intervals_to_reconstruct = end_interval - start_interval + 1
+            reconstructed_length = num_intervals_to_reconstruct * self.points_per_interval
+            
+            # 復元された部分のみを平滑化
+            interval_data = reconstructed_intervals[i, :reconstructed_length].unsqueeze(0).unsqueeze(0)  # (1, 1, length)
+            smoothed = self.final_reconstruction(interval_data)  # (1, 1, length)
+            smoothed = smoothed.squeeze(0).squeeze(0)  # (length,)
+            
+            # パディングを追加
+            if smoothed.shape[0] < max_length:
+                padding = torch.zeros(max_length - smoothed.shape[0], device=smoothed.device, dtype=smoothed.dtype)
+                smoothed = torch.cat([smoothed, padding], dim=0)
+            smoothed_intervals.append(smoothed)
         
-        return mask, reconstructed_intervals  # (batch_size, 30), (batch_size, 100)
+        reconstructed_intervals = torch.stack(smoothed_intervals, dim=0)  # (batch_size, max_length)
+        
+        return mask, reconstructed_intervals, reconstructed_intervals_info  # (batch_size, 30), (batch_size, max_length), (batch_size, 3)
 

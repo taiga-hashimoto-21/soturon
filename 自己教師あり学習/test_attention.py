@@ -104,9 +104,9 @@ def test_attention_weights(
             print(f"マスク形状: {m.shape}")
             print(f"ノイズ区間: {noise_intervals.cpu().numpy()}")
             
-            # アテンションウェイトを取得
+            # アテンションウェイトを取得（モデルの出力は5つ: out, cls_out, attention_weights, reconstructed_interval, reconstructed_intervals_info）
             try:
-                pred, cls_out, attention_weights = model(x, m, return_attention=True)
+                pred, cls_out, attention_weights, _, _ = model(x, m, return_attention=True)
                 
                 if attention_weights is None:
                     print("  ❌ アテンションウェイトが None です！")

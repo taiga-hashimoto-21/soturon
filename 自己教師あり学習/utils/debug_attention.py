@@ -88,8 +88,8 @@ def debug_attention_weights(
             m = batch['mask'].to(device)
             noise_interval = batch['noise_interval'].to(device)
             
-            # アテンションウェイトを取得
-            _, _, attention_weights = model(x, m, return_attention=True)
+            # アテンションウェイトを取得（モデルの出力は5つ: out, cls_out, attention_weights, reconstructed_interval, reconstructed_intervals_info）
+            _, _, attention_weights, _, _ = model(x, m, return_attention=True)
             
             if attention_weights is not None:
                 # アテンションウェイトの統計情報

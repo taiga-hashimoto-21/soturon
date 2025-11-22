@@ -126,8 +126,8 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
             m = batch['mask'].to(device)
             labels = batch['noise_interval'].to(device)
             
-            # アテンションウェイトを取得（4つの値を返す: out, cls_out, attention_weights, reconstructed_interval）
-            _, _, attention_weights, _ = model(x, m, return_attention=True)
+            # アテンションウェイトを取得（5つの値を返す: out, cls_out, attention_weights, reconstructed_interval, reconstructed_intervals_info）
+            _, _, attention_weights, _, _ = model(x, m, return_attention=True)
             
             # デバッグ: 最初のバッチでアテンションウェイトの形状と値を確認
             if batch_idx == 0 and attention_weights is not None:
@@ -315,10 +315,11 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
             original_data = original_data.to(device)
             
             # モデルの出力（復元機能付き）
-            _, _, attention_weights, reconstructed_interval = model(
+            _, _, attention_weights, reconstructed_interval, reconstructed_intervals_info = model(
                 x, mask, return_attention=True, num_intervals=num_intervals
             )
-            # reconstructed_interval: (B, 100) - 予測したノイズ区間のみ復元
+            # reconstructed_interval: (B, max_length) - 予測区間±2区間（最大500ポイント）
+            # reconstructed_intervals_info: (B, 3) - [start_interval, end_interval, predicted_interval]
             
             if reconstructed_interval is None:
                 continue
@@ -356,13 +357,24 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
                     
                     # 予測が正しい場合のみ復元損失を計算
                     if pred_interval == true_interval:
-                        # 真のノイズ区間のインデックス範囲を計算
-                        start_idx = true_interval * points_per_interval
-                        end_idx = min(start_idx + points_per_interval, original_data.size(1))
+                        # 復元範囲の情報を取得
+                        start_interval = reconstructed_intervals_info[i, 0].item()
+                        end_interval = reconstructed_intervals_info[i, 1].item()
                         
-                        # 復元した区間と元のデータを比較
-                        pred_reconstructed = reconstructed_interval[i]  # (100,)
-                        true_original = original_data[i, start_idx:end_idx]  # (100,)
+                        # 復元されたデータを取得（パディングを除く）
+                        num_intervals_reconstructed = end_interval - start_interval + 1
+                        reconstructed_length = num_intervals_reconstructed * points_per_interval
+                        pred_reconstructed = reconstructed_interval[i, :reconstructed_length]  # (reconstructed_length,)
+                        
+                        # 正解データも同じ範囲を取得
+                        true_start_idx = start_interval * points_per_interval
+                        true_end_idx = min((end_interval + 1) * points_per_interval, original_data.size(1))
+                        true_original = original_data[i, true_start_idx:true_end_idx]  # (reconstructed_length,)
+                        
+                        # 長さが一致することを確認
+                        min_length = min(pred_reconstructed.shape[0], true_original.shape[0])
+                        pred_reconstructed = pred_reconstructed[:min_length]
+                        true_original = true_original[:min_length]
                         
                         # MSE損失
                         interval_loss = F.mse_loss(pred_reconstructed, true_original)
@@ -536,9 +548,10 @@ def evaluate_noise_detection_reconstruction_model(
                 true_noise_intervals = true_noise_intervals.to(device)
             
             # モデルの出力
-            predicted_mask, reconstructed_interval = model(noisy_psd)
+            predicted_mask, reconstructed_interval, reconstructed_intervals_info = model(noisy_psd)
             # predicted_mask: (batch_size, 30) - 各区間のノイズ強度
-            # reconstructed_interval: (batch_size, 100) - 予測した区間のみ復元
+            # reconstructed_interval: (batch_size, max_length) - 予測区間±2区間（最大500ポイント）
+            # reconstructed_intervals_info: (batch_size, 3) - [start_interval, end_interval, predicted_interval]
             
             batch_size = noisy_psd.size(0)
             
@@ -557,23 +570,34 @@ def evaluate_noise_detection_reconstruction_model(
                 all_mask_labels.append(true_interval)
             
             # 2. 復元精度の評価
-            # reconstructed_intervalは予測した区間のみ（100ポイント）
+            # reconstructed_intervalは予測区間±2区間（最大500ポイント）
             for i in range(batch_size):
                 pred_interval = predicted_intervals[i].item()
                 true_interval = true_noise_intervals[i].item()
                 
                 # 予測した区間が真のノイズ区間と一致する場合のみ復元損失を計算
                 if pred_interval == true_interval:
-                    # 真のノイズ区間のインデックス範囲を計算
-                    start_idx = true_interval * points_per_interval
-                    end_idx = min(start_idx + points_per_interval, original_psd.size(1))
+                    # 復元範囲の情報を取得
+                    start_interval = reconstructed_intervals_info[i, 0].item()
+                    end_interval = reconstructed_intervals_info[i, 1].item()
                     
-                    # 予測した区間の復元精度を計算
-                    pred_interval_reconstructed = reconstructed_interval[i]  # (100,)
-                    true_interval_original = original_psd[i, start_idx:end_idx]  # (100,)
+                    # 復元されたデータを取得（パディングを除く）
+                    num_intervals_reconstructed = end_interval - start_interval + 1
+                    reconstructed_length = num_intervals_reconstructed * points_per_interval
+                    pred_reconstructed = reconstructed_interval[i, :reconstructed_length]  # (reconstructed_length,)
+                    
+                    # 正解データも同じ範囲を取得
+                    true_start_idx = start_interval * points_per_interval
+                    true_end_idx = min((end_interval + 1) * points_per_interval, original_psd.size(1))
+                    true_original = original_psd[i, true_start_idx:true_end_idx]  # (reconstructed_length,)
+                    
+                    # 長さが一致することを確認
+                    min_length = min(pred_reconstructed.shape[0], true_original.shape[0])
+                    pred_reconstructed = pred_reconstructed[:min_length]
+                    true_original = true_original[:min_length]
                     
                     # MSE損失
-                    interval_loss = F.mse_loss(pred_interval_reconstructed, true_interval_original)
+                    interval_loss = F.mse_loss(pred_reconstructed, true_original)
                     all_reconstruction_losses.append(interval_loss.item())
                     
                     # 復元精度（%）を計算

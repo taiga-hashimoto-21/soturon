@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>活性化エネルギー予測の理論式</title>
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>
+        window.MathJax = {
+            tex: {
+                inlineMath: [['$', '$'], ['\\(', '\\)']],
+                displayMath: [['$$', '$$'], ['\\[', '\\]']],
+                processEscapes: true,
+                processEnvironments: true
+            }
+        };
+    </script>
+    <style>
+        body {
+            font-family: 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic', 'Meiryo', sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+            margin-bottom: 30px;
+        }
+        h2 {
+            color: #34495e;
+            margin-top: 40px;
+            margin-bottom: 20px;
+            border-left: 5px solid #3498db;
+            padding-left: 15px;
+        }
+        table {
+            width: auto;
+            border-collapse: collapse;
+            margin: 20px auto;
+            background-color: white;
+            border: 1px solid black;
+        }
+        th {
+            background-color: white;
+            color: black;
+            padding: 15px;
+            text-align: left;
+            font-weight: bold;
+            font-size: 18px;
+            border: 1px solid black;
+        }
+        td {
+            padding: 12px 15px;
+            border: 1px solid black;
+        }
+        tr:hover {
+            background-color: white;
+        }
+        .formula {
+            background-color: white;
+            padding: 20px;
+            margin: 20px 0;
+            border-left: 4px solid #3498db;
+            border-radius: 5px;
+        }
+        .formula-label {
+            font-weight: bold;
+            color: #2c3e50;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+        .math-display {
+            text-align: center;
+            margin: 15px 0;
+            font-size: 18px;
+        }
+        .note {
+            background-color: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 5px;
+        }
+        .note-title {
+            font-weight: bold;
+            color: #856404;
+            margin-bottom: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>活性化エネルギー予測の理論式</h1>
+
+        <h2>データ作成に使用した値</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>パラメータ</th>
+                    <th>値 / 範囲</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>Eα</strong></td>
+                    <td>$0.1 \text{ meV} \sim 20 \text{ meV}$</td>
+                </tr>
+                <tr>
+                    <td><strong>Eβ</strong></td>
+                    <td>$12.5 \text{ meV} \sim 32.5 \text{ meV}$</td>
+                </tr>
+                <tr>
+                    <td><strong>NT</strong></td>
+                    <td>$(4 \times 10^{11})^{1.5} \times 1.0 \sim 1.3 \text{ /cm}^3$</td>
+                </tr>
+                <tr>
+                    <td><strong>V</strong></td>
+                    <td>$10^7 \text{ cm/s}$</td>
+                </tr>
+                <tr>
+                    <td><strong>KB</strong></td>
+                    <td>$8.6 \times 10^{-5} \text{ eV/k}$</td>
+                </tr>
+                <tr>
+                    <td><strong>T</strong></td>
+                    <td>$300 \text{ k}$</td>
+                </tr>
+                <tr>
+                    <td><strong>σα</strong></td>
+                    <td>$10^{-23} \text{ cm}^2$</td>
+                </tr>
+                <tr>
+                    <td><strong>σβ</strong></td>
+                    <td>$\sigma_\alpha \times 830 \text{ cm}^2$</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h2>理論式</h2>
+
+        <div class="formula">
+            <div class="formula-label">式(1): PSDの理論式</div>
+            <div class="math-display">
+                $$S_I(f) = \frac{A_\alpha(I_{\text{bias}}) I_{\text{bias}}^2}{1 + \left(\frac{f}{f_\alpha}\right)^2} + \frac{A_\beta(I_{\text{bias}}) I_{\text{bias}}^2}{1 + \left(\frac{f}{f_\beta}\right)^2} + C$$
+            </div>
+        </div>
+
+        <div class="formula">
+            <div class="formula-label">式(2): 緩和時間と活性化エネルギーの関係</div>
+            <div class="math-display">
+                $$\tau(T) = \frac{1}{2\pi f(T)} = \frac{1}{\sigma^{(0)} \times \exp\left(-\frac{E}{k_B T}\right) \times N_T \times \nu}$$
+            </div>
+        </div>
+
+        <div class="note">
+            <div class="note-title">補足説明</div>
+            <ul>
+                <li><strong>式(1)</strong>: PSD（パワースペクトル密度）の周波数特性を表す式。$\alpha$成分と$\beta$成分の2つのローレンツ型の項と定数項$C$から構成される。</li>
+                <li><strong>式(2)</strong>: 緩和時間$\tau(T)$と活性化エネルギー$E$の関係を表す式。アレニウス型の温度依存性を含む。</li>
+                <li><strong>活性化エネルギーの逆算</strong>: PSDデータから式(1)のパラメータ（$f_\alpha$, $f_\beta$など）を推定し、式(2)を使って活性化エネルギー$E_\alpha$と$E_\beta$を計算する。</li>
+            </ul>
+        </div>
+
+        <h2>データの対応関係</h2>
+        <div class="note">
+            <ul>
+                <li><strong>正解データ</strong>: <code>data_lowF_noise.pickle</code>の<code>y</code>
+                    <ul>
+                        <li>$y[:, 0] = E_\alpha / 10$ (活性化エネルギーα)</li>
+                        <li>$y[:, 1] = E_\beta / 10$ (活性化エネルギーβ)</li>
+                    </ul>
+                </li>
+                <li><strong>値の範囲</strong>:
+                    <ul>
+                        <li>$E_\alpha$: $0.1 \text{ meV} \sim 20 \text{ meV}$ → $y[:, 0]$: $0.01 \sim 2.0$</li>
+                        <li>$E_\beta$: $12.5 \text{ meV} \sim 32.5 \text{ meV}$ → $y[:, 1]$: $1.25 \sim 3.25$</li>
+                    </ul>
+                </li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>
+

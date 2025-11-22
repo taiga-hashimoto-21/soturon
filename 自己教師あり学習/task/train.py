@@ -32,7 +32,9 @@ def compute_loss(
     mask_positions,
     attention_weights,
     noise_intervals,
+    noise_strength=None,  # (B, num_intervals) 各區間のノイズ強度（正規化済み）
     reconstructed_interval=None,
+    reconstructed_intervals_info=None,  # (B, 3) 復元範囲の情報 [start_interval, end_interval, predicted_interval]
     original_data=None,
     lambda_reg=0.1,
     lambda_recon=1.0,
@@ -43,7 +45,7 @@ def compute_loss(
     batch_idx=0,
 ):
     """
-    損失関数を計算（ランキング損失 + 復元損失）
+    損失関数を計算（マスク予測損失 + ノイズ強度の逆数損失 + 復元損失）
     
     Args:
         predictions: (B, L) 予測されたPSDデータ（マスク予測タスク用）
@@ -51,20 +53,21 @@ def compute_loss(
         mask_positions: (B, L) マスク位置
         attention_weights: (B, n_heads, L+1, L+1) アテンションウェイト
         noise_intervals: (B,) ノイズ区間のインデックス（真の値）
+        noise_strength: (B, num_intervals) 各區間のノイズ強度（正規化済み、合計=1）
         reconstructed_interval: (B, 100) 復元された区間（Noneの場合は計算しない）
         original_data: (B, L) 元のデータ（ノイズ付与前、Noneの場合は計算しない）
         lambda_reg: 正則化項の重み
         lambda_recon: 復元損失の重み
         num_intervals: 区間数
         points_per_interval: 1区間あたりのポイント数
-        margin: ランキング損失のマージン
+        margin: マージン（noise_strengthがNoneの場合のフォールバック用）
         debug: デバッグ情報を出力するか
         batch_idx: バッチインデックス（デバッグ用）
     
     Returns:
         total_loss: 総損失
         mask_loss: マスク予測損失
-        reg_loss: ランキング損失
+        reg_loss: 正則化損失（ノイズ強度の逆数損失）
         recon_loss: 復元損失（Noneの場合は計算されない）
     """
     # 1. マスク予測損失
@@ -73,7 +76,7 @@ def compute_loss(
     else:
         mask_loss = torch.tensor(0.0, device=predictions.device)
     
-    # 2. ランキング損失: ノイズ区間のアテンション < 正常区間のアテンション
+    # 2. 正則化損失: アテンションウェイトがノイズ強度の逆数になるように学習
     reg_loss = torch.tensor(0.0, device=predictions.device)
     
     if attention_weights is not None:
@@ -107,109 +110,67 @@ def compute_loss(
         
         interval_attention = torch.stack(interval_attention_list)  # (B, num_intervals)
         
-        # アテンションウェイトをスケーリング（値が小さいため）
-        # 現在の値: 0.0003程度 → 100倍で0.03程度にする（損失が適切な範囲になるように）
-        attention_scale = 100.0
-        interval_attention = interval_attention * attention_scale
-        
-        if debug and batch_idx == 0:
-            print(f"\n区間ごとのアテンション:")
-            print(f"interval_attention.shape: {interval_attention.shape}")
-            print(f"interval_attention.min(): {interval_attention.min().item():.6f}")
-            print(f"interval_attention.max(): {interval_attention.max().item():.6f}")
-            print(f"interval_attention.mean(): {interval_attention.mean().item():.6f}")
-            print(f"interval_attention.std(): {interval_attention.std().item():.6f}")
-            print(f"\n最初のサンプル (i=0) の区間アテンション:")
-            print(f"  全区間のアテンション: {interval_attention[0].detach().cpu().numpy()}")
-        
-        # ランキング損失を計算（数式(3)と(4)に基づく）
-        ranking_losses = []
-        for i in range(B):
-            noise_idx = noise_intervals[i].item()
-            noise_attn = interval_attention[i, noise_idx]  # ノイズ区間のアテンション a_ij
+        if noise_strength is not None:
+            # ノイズ強度の逆数を使った損失（野中さんの説明通り）
+            # 目標: attention_weight[i] ≈ 1 / normalized_noise_strength[i]
+            # ノイズ強度が0の場合は逆数が無限大になるので、小さな値（epsilon）を加える
+            epsilon = 1e-6
+            noise_strength_safe = noise_strength + epsilon  # (B, num_intervals)
+            target_attention = 1.0 / noise_strength_safe  # (B, num_intervals)
             
-            # 正常区間のアテンションを取得（ノイズ区間以外）
-            normal_indices = [j for j in range(num_intervals) if j != noise_idx]
-            normal_attn_list = interval_attention[i, normal_indices]
+            # アテンションウェイトを正規化（合計=1になるように）
+            # アテンションウェイトは既に合計=1になっているはずだが、念のため正規化
+            interval_attention_normalized = F.normalize(interval_attention, p=1, dim=1)  # (B, num_intervals)
             
-            if debug and batch_idx == 0 and i == 0:
-                print(f"\nサンプル {i} の詳細:")
-                print(f"  ノイズ区間インデックス: {noise_idx}")
-                print(f"  ノイズ区間のアテンション: {noise_attn.item():.6f}")
-                print(f"  正常区間のアテンション (最初の5つ): {normal_attn_list[:5].detach().cpu().numpy()}")
-                print(f"  正常区間のアテンション平均: {normal_attn_list.mean().item():.6f}")
-                print(f"  正常区間 - ノイズ区間: {(normal_attn_list.mean() - noise_attn).item():.6f}")
+            # 目標値も正規化（合計=1になるように）
+            target_attention_normalized = F.normalize(target_attention, p=1, dim=1)  # (B, num_intervals)
             
-            # 数式(4): Y_dot_ij = { -1, if Y_hat_i = Y_hat_j ; +1, if Y_hat_i ≠ Y_hat_j }
-            # ノイズ検知の場合:
-            # - ノイズ区間: Y_hat = 1
-            # - 正常区間: Y_hat = 0
-            # 
-            # ノイズ区間(i) vs ノイズ区間(j): Y_dot_ij = -1 (同じラベル)
-            # ノイズ区間(i) vs 正常区間(k): Y_dot_ik = +1 (異なるラベル)
-            
-            for idx_in_normal_list, normal_attn in enumerate(normal_attn_list):
-                # 数式(3): L_rank = (1 - Y_dot_ij * Y_dot_ik) * max(m, Y_dot_ij * a_ij + Y_dot_ik * a_ik)
-                # 
-                # ノイズ区間(i) vs ノイズ区間(j) vs 正常区間(k)の場合:
-                # Y_dot_ij = -1 (ノイズ区間同士は同じラベル)
-                # Y_dot_ik = +1 (ノイズ区間と正常区間は異なるラベル)
-                # 
-                # Y_dot_ij * Y_dot_ik = (-1) * (+1) = -1
-                # (1 - Y_dot_ij * Y_dot_ik) = (1 - (-1)) = 2
-                # 
-                # Y_dot_ij * a_ij + Y_dot_ik * a_ik = (-1) * noise_attn + (+1) * normal_attn
-                # = normal_attn - noise_attn
-                # 
-                # ノイズ区間のアテンション < 正常区間のアテンション になるように学習
-                # → normal_attn - noise_attn > 0 になるように
-                # → max(margin, normal_attn - noise_attn) を損失とする
-                
-                # 係数項: (1 - Y_dot_ij * Y_dot_ik)
-                Y_dot_ij = -1  # ノイズ区間同士（同じラベル）
-                Y_dot_ik = +1  # ノイズ区間と正常区間（異なるラベル）
-                coeff = 1 - Y_dot_ij * Y_dot_ik  # = 1 - (-1) * (+1) = 2
-                
-                # アテンションの線形結合: Y_dot_ij * a_ij + Y_dot_ik * a_ik
-                attn_linear = Y_dot_ij * noise_attn + Y_dot_ik * normal_attn
-                # = (-1) * noise_attn + (+1) * normal_attn
-                # = normal_attn - noise_attn
-                
-                # ランキング損失の計算を修正
-                # 目的: normal_attn - noise_attn > margin になるように学習
-                # 損失 = max(0, margin - attn_linear)
-                # - attn_linearが大きい（良い状態）→ 損失が小さい
-                # - attn_linearが小さい/マイナス（悪い状態）→ 損失が大きい
-                max_term = torch.clamp(margin - attn_linear, min=0.0)
-                
-                # 数式(3): (1 - Y_dot_ij * Y_dot_ik) * max(m, Y_dot_ij * a_ij + Y_dot_ik * a_ik)
-                loss_term = coeff * max_term
-                ranking_losses.append(loss_term)
-                
-                if debug and batch_idx == 0 and i == 0 and len(ranking_losses) <= 5:
-                    normal_interval_idx = normal_indices[idx_in_normal_list]
-                    print(f"    正常区間 {normal_interval_idx}:")
-                    print(f"      normal_attn: {normal_attn.item():.6f}")
-                    print(f"      attn_linear (normal - noise): {attn_linear.item():.6f}")
-                    print(f"      max_term: {max_term.item():.6f}")
-                    print(f"      loss_term: {loss_term.item():.6f}")
-        
-        if len(ranking_losses) > 0:
-            avg_ranking_loss = torch.stack(ranking_losses).mean()
-            reg_loss = lambda_reg * avg_ranking_loss
+            # MSE損失で学習
+            reg_loss = lambda_reg * F.mse_loss(interval_attention_normalized, target_attention_normalized)
             
             if debug and batch_idx == 0:
-                print(f"\nランキング損失の統計:")
-                print(f"  ranking_losses数: {len(ranking_losses)}")
-                print(f"  平均ランキング損失: {avg_ranking_loss.item():.6f}")
+                print(f"\n=== ノイズ強度の逆数損失 (バッチ {batch_idx}) ===")
+                print(f"interval_attention.shape: {interval_attention.shape}")
+                print(f"noise_strength.shape: {noise_strength.shape}")
+                print(f"target_attention.shape: {target_attention.shape}")
+                print(f"\n最初のサンプル (i=0):")
+                print(f"  ノイズ強度: {noise_strength[0].detach().cpu().numpy()}")
+                print(f"  目標アテンション (1/ノイズ強度): {target_attention_normalized[0].detach().cpu().numpy()}")
+                print(f"  実際のアテンション: {interval_attention_normalized[0].detach().cpu().numpy()}")
+                print(f"  MSE損失: {F.mse_loss(interval_attention_normalized[0:1], target_attention_normalized[0:1]).item():.6f}")
                 print(f"  lambda_reg: {lambda_reg}")
-                print(f"  reg_loss (lambda_reg * avg): {reg_loss.item():.6f}")
-                print(f"  margin: {margin}")
+                print(f"  reg_loss: {reg_loss.item():.6f}")
                 print("=" * 60)
+        else:
+            # フォールバック: ノイズ強度が提供されない場合は旧実装を使用（後方互換性）
+            # アテンションウェイトをスケーリング（値が小さいため）
+            attention_scale = 100.0
+            interval_attention = interval_attention * attention_scale
+            
+            # 旧実装: ノイズ区間のアテンション < 正常区間のアテンション になるように学習
+            fallback_losses = []
+            for i in range(B):
+                noise_idx = noise_intervals[i].item()
+                noise_attn = interval_attention[i, noise_idx]
+                normal_indices = [j for j in range(num_intervals) if j != noise_idx]
+                normal_attn_list = interval_attention[i, normal_indices]
+                
+                for normal_attn in normal_attn_list:
+                    attn_linear = normal_attn - noise_attn
+                    max_term = torch.clamp(margin - attn_linear, min=0.0)
+                    loss_term = 2.0 * max_term  # coeff = 2
+                    fallback_losses.append(loss_term)
+            
+            if len(fallback_losses) > 0:
+                avg_fallback_loss = torch.stack(fallback_losses).mean()
+                reg_loss = lambda_reg * avg_fallback_loss
+            else:
+                reg_loss = torch.tensor(0.0, device=predictions.device)
     
     # 3. 復元損失（ノイズ検知が正しい場合のみ計算 - アプローチ2）
+    # 予測区間を中心に左右2区間ずつ（合計5区間）を復元
     recon_loss = None
-    if reconstructed_interval is not None and original_data is not None:
+    if reconstructed_interval is not None and original_data is not None and reconstructed_intervals_info is not None:
         B = predictions.shape[0]
         L = predictions.shape[1]
         
@@ -243,13 +204,24 @@ def compute_loss(
                 
                 # 予測が正しい場合のみ復元損失を計算（アプローチ2）
                 if pred_interval == true_interval:
-                    # 真のノイズ区間のインデックス範囲を計算
-                    start_idx = true_interval * points_per_interval
-                    end_idx = min(start_idx + points_per_interval, L)
+                    # 復元範囲の情報を取得
+                    start_interval = reconstructed_intervals_info[i, 0].item()
+                    end_interval = reconstructed_intervals_info[i, 1].item()
                     
-                    # 復元した区間と元のデータを比較
-                    pred_reconstructed = reconstructed_interval[i]  # (100,)
-                    true_original = original_data[i, start_idx:end_idx]  # (100,)
+                    # 復元されたデータを取得（パディングを除く）
+                    num_intervals_reconstructed = end_interval - start_interval + 1
+                    reconstructed_length = num_intervals_reconstructed * points_per_interval
+                    pred_reconstructed = reconstructed_interval[i, :reconstructed_length]  # (reconstructed_length,)
+                    
+                    # 正解データも同じ範囲を取得
+                    true_start_idx = start_interval * points_per_interval
+                    true_end_idx = min((end_interval + 1) * points_per_interval, L)
+                    true_original = original_data[i, true_start_idx:true_end_idx]  # (reconstructed_length,)
+                    
+                    # 長さが一致することを確認
+                    min_length = min(pred_reconstructed.shape[0], true_original.shape[0])
+                    pred_reconstructed = pred_reconstructed[:min_length]
+                    true_original = true_original[:min_length]
                     
                     # MSE損失
                     interval_loss = F.mse_loss(pred_reconstructed, true_original)
@@ -261,12 +233,17 @@ def compute_loss(
                 recon_loss = torch.tensor(0.0, device=predictions.device)
             
             if debug and batch_idx == 0:
-                print(f"\n復元損失の統計:")
+                print(f"\n復元損失の統計（5区間復元）:")
                 print(f"  予測が正しいサンプル数: {len(reconstruction_losses)} / {B}")
                 if len(reconstruction_losses) > 0:
                     print(f"  平均復元損失: {torch.stack(reconstruction_losses).mean().item():.6f}")
                     print(f"  lambda_recon: {lambda_recon}")
                     print(f"  recon_loss (lambda_recon * avg): {recon_loss.item():.6f}")
+                    if len(reconstruction_losses) > 0:
+                        sample_idx = 0
+                        start_interval = reconstructed_intervals_info[sample_idx, 0].item()
+                        end_interval = reconstructed_intervals_info[sample_idx, 1].item()
+                        print(f"  サンプル0の復元範囲: 区間{start_interval}〜{end_interval}（合計{end_interval-start_interval+1}区間）")
     
     # 4. 総損失
     if recon_loss is not None:
@@ -404,28 +381,87 @@ def train_task4(
             y = batch["target"].to(device)
             m = batch["mask"].to(device)
             noise_intervals = batch["noise_interval"].to(device)
+            noise_strength = batch.get("noise_strength", None)  # 各區間のノイズ強度（正規化済み）
+            if noise_strength is not None:
+                noise_strength = noise_strength.to(device)
             original_data = batch.get("original", None)  # 元のデータ（ノイズ付与前）
             if original_data is not None:
                 original_data = original_data.to(device)
+            
+            # 学習開始時にノイズ強度を確認（最初のバッチのみ）
+            if epoch == start_epoch and batch_idx == 0:
+                print("\n" + "=" * 60)
+                print("【学習開始時のノイズ強度確認】")
+                print("=" * 60)
+                if noise_strength is not None:
+                    noise_strength_np = noise_strength.cpu().numpy()  # (batch_size, num_intervals)
+                    print(f"ノイズ強度の形状: {noise_strength_np.shape}")
+                    print(f"バッチサイズ: {noise_strength_np.shape[0]}")
+                    print(f"区間数: {noise_strength_np.shape[1]}")
+                    
+                    # 各サンプルのノイズ強度を確認
+                    for sample_idx in range(min(3, noise_strength_np.shape[0])):  # 最初の3サンプルを確認
+                        sample_noise_strength = noise_strength_np[sample_idx]
+                        sample_noise_interval = noise_intervals[sample_idx].item()
+                        
+                        print(f"\n【サンプル {sample_idx}】")
+                        print(f"  ノイズが付与された区間: {sample_noise_interval}")
+                        print(f"  ノイズ強度の統計:")
+                        print(f"    最小値: {sample_noise_strength.min():.6f}")
+                        print(f"    最大値: {sample_noise_strength.max():.6f}")
+                        print(f"    平均値: {sample_noise_strength.mean():.6f}")
+                        print(f"    標準偏差: {sample_noise_strength.std():.6f}")
+                        print(f"    合計: {sample_noise_strength.sum():.6f}")
+                        
+                        # ノイズ区間と正常区間の比較
+                        noise_interval_strength = sample_noise_strength[sample_noise_interval]
+                        normal_intervals = [i for i in range(num_intervals) if i != sample_noise_interval]
+                        normal_interval_strength = sample_noise_strength[normal_intervals].mean()
+                        
+                        print(f"  ノイズ区間（区間{sample_noise_interval}）の強度: {noise_interval_strength:.6f}")
+                        print(f"  正常区間の平均強度: {normal_interval_strength:.6f}")
+                        print(f"  差（ノイズ区間 - 正常区間）: {noise_interval_strength - normal_interval_strength:.6f}")
+                        if normal_interval_strength > 0:
+                            print(f"  比率（ノイズ区間 / 正常区間）: {noise_interval_strength / normal_interval_strength:.2f}倍")
+                        
+                        # 問題の確認
+                        if sample_noise_strength.std() < 0.0001:
+                            print(f"  ⚠️ 警告: ノイズ強度の標準偏差が非常に小さいです（{sample_noise_strength.std():.6f}）")
+                            print("     全ての区間で同じ値になっている可能性があります。")
+                            print("     学習を中断することを推奨します。")
+                        elif noise_interval_strength <= normal_interval_strength:
+                            print(f"  ⚠️ 警告: ノイズ区間の強度が正常区間以下です。")
+                            print("     ノイズ強度の計算に問題がある可能性があります。")
+                            print("     学習を中断することを推奨します。")
+                        else:
+                            print(f"  ✅ ノイズ強度は正しく計算されています。")
+                    
+                    print("\n" + "=" * 60)
+                else:
+                    print("⚠️ 警告: noise_strengthがNoneです。ノイズ強度の計算が行われていません。")
+                    print("=" * 60)
             
             optimizer.zero_grad()
             
             with autocast(enabled=(device == "cuda")):
                 # 復元機能を使う場合はreturn_attention=Trueで復元結果も取得
                 if original_data is not None:
-                    pred, cls_out, attention_weights, reconstructed_interval = model(
+                    pred, cls_out, attention_weights, reconstructed_interval, reconstructed_intervals_info = model(
                         x, m, return_attention=True, num_intervals=num_intervals
                     )
                 else:
-                    pred, cls_out, attention_weights = model(x, m, return_attention=True)
+                    pred, cls_out, attention_weights, _, _ = model(x, m, return_attention=True)
                     reconstructed_interval = None
+                    reconstructed_intervals_info = None
                 
                 # 最初のバッチのみデバッグ情報を出力
                 debug_flag = (epoch == start_epoch and batch_idx == 0)
                 
                 total_loss, mask_loss, reg_loss, recon_loss = compute_loss(
                     pred, y, m, attention_weights, noise_intervals,
+                    noise_strength=noise_strength,  # 各區間のノイズ強度
                     reconstructed_interval=reconstructed_interval,
+                    reconstructed_intervals_info=reconstructed_intervals_info,  # 復元範囲の情報
                     original_data=original_data,
                     lambda_reg=lambda_reg,
                     lambda_recon=1.0,  # 復元損失の重み
@@ -475,18 +511,25 @@ def train_task4(
                     if original_data is not None:
                         original_data = original_data.to(device)
                     
+                    noise_strength = batch.get("noise_strength", None)  # 各區間のノイズ強度（正規化済み）
+                    if noise_strength is not None:
+                        noise_strength = noise_strength.to(device)
+                    
                     with autocast(enabled=(device == "cuda")):
                         if original_data is not None:
-                            pred, cls_out, attention_weights, reconstructed_interval = model(
+                            pred, cls_out, attention_weights, reconstructed_interval, reconstructed_intervals_info = model(
                                 x, m, return_attention=True, num_intervals=num_intervals
                             )
                         else:
-                            pred, cls_out, attention_weights = model(x, m, return_attention=True)
+                            pred, cls_out, attention_weights, _, _ = model(x, m, return_attention=True)
                             reconstructed_interval = None
+                            reconstructed_intervals_info = None
                         
                         total_loss, _, _, recon_loss = compute_loss(
                             pred, y, m, attention_weights, noise_intervals,
+                            noise_strength=noise_strength,  # 各區間のノイズ強度
                             reconstructed_interval=reconstructed_interval,
+                            reconstructed_intervals_info=reconstructed_intervals_info,  # 復元範囲の情報
                             original_data=original_data,
                             lambda_reg=lambda_reg,
                             lambda_recon=1.0,

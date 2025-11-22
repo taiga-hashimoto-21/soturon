@@ -96,7 +96,8 @@ class Task4BERT(nn.Module):
             out: (B, L) 予測されたPSDデータ（マスク予測タスク用）
             cls_out: (B, d_model) CLSトークンの表現
             attention_weights: (B, n_heads, L+1, L+1) アテンションウェイト（return_attention=Trueの場合）
-            reconstructed_interval: (B, 100) 復元された区間（return_attention=Trueの場合のみ）
+            reconstructed_interval: (B, max_length) 復元された区間（予測区間±2区間、最大500ポイント、return_attention=Trueの場合のみ）
+            reconstructed_intervals_info: (B, 3) 復元範囲の情報 [start_interval, end_interval, predicted_interval]（return_attention=Trueの場合のみ）
         """
         B, L = x.shape
         assert L == self.seq_len, f"seq_len mismatch: expected {self.seq_len}, got {L}"
@@ -161,6 +162,7 @@ class Task4BERT(nn.Module):
         cls_out = encoded[0].transpose(0, 1)  # (B, d_model)
         
         # 復元機能: アテンションウェイトからノイズ区間を検知して復元
+        # 予測区間を中心に左右2区間ずつ（合計5区間）を復元
         reconstructed_interval = None
         if return_attention and attention_weights is not None:
             # CLSトークンから各区間へのアテンションを取得
@@ -169,30 +171,65 @@ class Task4BERT(nn.Module):
             # 最もアテンションが低い区間をノイズ区間として検知
             predicted_noise_intervals = cls_attention.argmin(dim=1)  # (B,) - 予測されたノイズ区間
             
-            # 予測した区間の特徴を取得して復元
+            # 予測した区間を中心に左右2区間ずつ（合計5区間）を復元
             points_per_interval = self.seq_len // num_intervals
+            window_size = 2  # 左右に2区間ずつ
             reconstructed_intervals_list = []
             
             for i in range(B):
                 predicted_interval = predicted_noise_intervals[i].item()
-                # 予測した区間の開始・終了インデックス
-                start_idx = predicted_interval * points_per_interval
-                end_idx = min(start_idx + points_per_interval, self.seq_len)
                 
-                # 予測した区間のエンコードされた特徴を取得
-                # encoded_seq: (B, L, d_model) から該当区間の特徴を取得
-                interval_features = encoded_seq[i, start_idx:end_idx, :]  # (points_per_interval, d_model)
-                # 区間の特徴を平均化（または最大値など）
-                interval_feature = interval_features.mean(dim=0)  # (d_model,)
+                # 復元する区間の範囲を決定（予測区間±2区間）
+                start_interval = max(0, predicted_interval - window_size)
+                end_interval = min(num_intervals - 1, predicted_interval + window_size)
+                num_intervals_to_reconstruct = end_interval - start_interval + 1
                 
-                # 復元ヘッドで復元
-                reconstructed_interval_single = self.reconstruction_head(interval_feature.unsqueeze(0))  # (1, 100)
-                reconstructed_intervals_list.append(reconstructed_interval_single.squeeze(0))  # (100,)
+                # 5区間分の特徴を取得して復元
+                reconstructed_parts = []
+                for interval_idx in range(start_interval, end_interval + 1):
+                    # 各区間の開始・終了インデックス
+                    start_idx = interval_idx * points_per_interval
+                    end_idx = min(start_idx + points_per_interval, self.seq_len)
+                    
+                    # 区間のエンコードされた特徴を取得
+                    interval_features = encoded_seq[i, start_idx:end_idx, :]  # (points_per_interval, d_model)
+                    # 区間の特徴を平均化
+                    interval_feature = interval_features.mean(dim=0)  # (d_model,)
+                    
+                    # 復元ヘッドで復元
+                    reconstructed_interval_single = self.reconstruction_head(interval_feature.unsqueeze(0))  # (1, 100)
+                    reconstructed_parts.append(reconstructed_interval_single.squeeze(0))  # (100,)
+                
+                # 5区間分を結合（合計500ポイント）
+                reconstructed_combined = torch.cat(reconstructed_parts, dim=0)  # (num_intervals_to_reconstruct * 100,)
+                reconstructed_intervals_list.append(reconstructed_combined)
             
-            reconstructed_interval = torch.stack(reconstructed_intervals_list, dim=0)  # (B, 100)
+            # バッチごとに異なる長さになる可能性があるため、最大長に合わせてパディング
+            max_length = max(r.shape[0] for r in reconstructed_intervals_list)
+            padded_reconstructed = []
+            reconstructed_intervals_info_list = []
+            
+            for i, r in enumerate(reconstructed_intervals_list):
+                predicted_interval = predicted_noise_intervals[i].item()
+                start_interval = max(0, predicted_interval - window_size)
+                end_interval = min(num_intervals - 1, predicted_interval + window_size)
+                
+                if r.shape[0] < max_length:
+                    # パディング（最後に0を追加）
+                    padding = torch.zeros(max_length - r.shape[0], device=r.device, dtype=r.dtype)
+                    r = torch.cat([r, padding], dim=0)
+                padded_reconstructed.append(r)
+                
+                # 復元範囲の情報を保存
+                reconstructed_intervals_info_list.append(torch.tensor([
+                    start_interval, end_interval, predicted_interval
+                ], device=r.device, dtype=torch.long))
+            
+            reconstructed_interval = torch.stack(padded_reconstructed, dim=0)  # (B, max_length)
+            reconstructed_intervals_info = torch.stack(reconstructed_intervals_info_list, dim=0)  # (B, 3)
         
         if return_attention:
-            return out, cls_out, attention_weights, reconstructed_interval
+            return out, cls_out, attention_weights, reconstructed_interval, reconstructed_intervals_info
         else:
             return out, cls_out
     
