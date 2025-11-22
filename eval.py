@@ -126,8 +126,8 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
             m = batch['mask'].to(device)
             labels = batch['noise_interval'].to(device)
             
-            # アテンションウェイトを取得
-            _, _, attention_weights = model(x, m, return_attention=True)
+            # アテンションウェイトを取得（4つの値を返す: out, cls_out, attention_weights, reconstructed_interval）
+            _, _, attention_weights, _ = model(x, m, return_attention=True)
             
             # デバッグ: 最初のバッチでアテンションウェイトの形状と値を確認
             if batch_idx == 0 and attention_weights is not None:
@@ -294,32 +294,99 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
     except:
         roc_auc = 0.0
     
-    # 復元損失を計算（マスクされた部分の復元精度）
+    # 復元損失を計算（ノイズ検知した区間の復元精度）
     # データローダーを再度ループして復元損失を計算
     model.eval()
     all_reconstruction_losses = []
+    all_reconstruction_accuracies = []
+    points_per_interval = 3000 // num_intervals  # 100ポイント
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             x = batch['input'].to(device)  # マスクされたデータ
-            target = batch['target'].to(device)  # ノイズ付きデータ（マスクなし、復元目標）
             mask = batch['mask'].to(device)  # マスク位置
+            noise_intervals = batch['noise_interval'].to(device)  # 真のノイズ区間
+            original_data = batch.get('original', None)  # 元のデータ（ノイズ付与前）
             
-            # モデルの出力（マスク予測）
-            predictions, _ = model(x, mask, return_attention=False)
-            # predictions: (B, L) - 予測されたPSDデータ
+            if original_data is None:
+                # 固定データセットの場合は復元損失を計算できない
+                continue
             
-            # マスクされた部分の復元損失を計算
-            if mask.any():
-                # マスクされた部分のみでMSE損失を計算
-                mask_loss = F.mse_loss(predictions[mask], target[mask])
-                all_reconstruction_losses.append(mask_loss.item())
+            original_data = original_data.to(device)
+            
+            # モデルの出力（復元機能付き）
+            _, _, attention_weights, reconstructed_interval = model(
+                x, mask, return_attention=True, num_intervals=num_intervals
+            )
+            # reconstructed_interval: (B, 100) - 予測したノイズ区間のみ復元
+            
+            if reconstructed_interval is None:
+                continue
+            
+            # アテンションウェイトからノイズ区間を予測
+            if attention_weights is not None:
+                # CLSトークンから各区間へのアテンションを取得
+                if hasattr(model, 'get_cls_attention_to_intervals'):
+                    cls_attention = model.get_cls_attention_to_intervals(
+                        attention_weights, num_intervals=num_intervals
+                    )
+                else:
+                    # フォールバック: 手動で計算
+                    B = attention_weights.shape[0]
+                    L = x.shape[1]
+                    cls_attention_full = attention_weights[:, :, 0, 1:]  # (B, n_heads, L)
+                    cls_attention_mean = cls_attention_full.mean(dim=1)  # (B, L)
+                    
+                    cls_attention_intervals = []
+                    for i in range(num_intervals):
+                        start_idx = i * points_per_interval
+                        end_idx = min(start_idx + points_per_interval, L)
+                        interval_attn = cls_attention_mean[:, start_idx:end_idx].mean(dim=1)
+                        cls_attention_intervals.append(interval_attn)
+                    
+                    cls_attention = torch.stack(cls_attention_intervals, dim=1)  # (B, num_intervals)
+                
+                # 最もアテンションが低い区間をノイズ区間として予測
+                predicted_noise_intervals = cls_attention.argmin(dim=1)  # (B,)
+                
+                # 復元損失を計算（予測が正しい場合のみ - アプローチ2）
+                for i in range(x.size(0)):
+                    pred_interval = predicted_noise_intervals[i].item()
+                    true_interval = noise_intervals[i].item()
+                    
+                    # 予測が正しい場合のみ復元損失を計算
+                    if pred_interval == true_interval:
+                        # 真のノイズ区間のインデックス範囲を計算
+                        start_idx = true_interval * points_per_interval
+                        end_idx = min(start_idx + points_per_interval, original_data.size(1))
+                        
+                        # 復元した区間と元のデータを比較
+                        pred_reconstructed = reconstructed_interval[i]  # (100,)
+                        true_original = original_data[i, start_idx:end_idx]  # (100,)
+                        
+                        # MSE損失
+                        interval_loss = F.mse_loss(pred_reconstructed, true_original)
+                        all_reconstruction_losses.append(interval_loss.item())
+                        
+                        # 復元精度（%）を計算
+                        # 正規化されたデータでは相対誤差が厳しすぎるため、
+                        # MSE損失から復元精度を計算する方法に変更
+                        # 復元精度 = max(0, (1 - sqrt(MSE) / std) * 100)
+                        # std: データの標準偏差（約0.82）
+                        mse_loss = interval_loss.item()
+                        data_std = 0.82  # 正規化後の標準偏差（約0.82）
+                        rmse = np.sqrt(mse_loss)
+                        relative_rmse = rmse / data_std
+                        reconstruction_accuracy = max(0.0, (1.0 - relative_rmse) * 100.0)
+                        all_reconstruction_accuracies.append(reconstruction_accuracy)
     
     # 復元損失の平均
     if len(all_reconstruction_losses) > 0:
         reconstruction_loss = np.mean(all_reconstruction_losses)
+        reconstruction_accuracy = np.mean(all_reconstruction_accuracies)
     else:
         reconstruction_loss = None
+        reconstruction_accuracy = None
     
     # 主要な損失: 復元損失（MSE損失）
     # 復元損失が最も重要なので、'loss'キーに復元損失を設定
@@ -333,7 +400,8 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
         'roc_auc': roc_auc,
         'loss': primary_loss,  # 復元損失（MSE損失）- 最も重要な指標
         'reconstruction_loss': reconstruction_loss,  # 復元損失（明示的に）
-        'mask_evaluation_loss': evaluation_loss,  # CrossEntropyLoss（マスク予測の損失）
+        'reconstruction_accuracy': reconstruction_accuracy,  # 復元精度（%）
+        'mask_evaluation_loss': evaluation_loss,  # CrossEntropyLoss（ノイズ検知の損失）
         'attention_diff': attention_diff,
         'best_threshold': best_threshold,
         'confusion_matrix': cm,
@@ -509,12 +577,15 @@ def evaluate_noise_detection_reconstruction_model(
                     all_reconstruction_losses.append(interval_loss.item())
                     
                     # 復元精度（%）を計算
-                    # 相対誤差から復元精度を計算: accuracy = (1 - relative_error) * 100
-                    relative_error = torch.abs(pred_interval_reconstructed - true_interval_original) / (
-                        torch.abs(true_interval_original) + 1e-8
-                    )
-                    relative_error_mean = relative_error.mean().item()
-                    reconstruction_accuracy = max(0.0, (1.0 - relative_error_mean) * 100.0)
+                    # 正規化されたデータでは相対誤差が厳しすぎるため、
+                    # MSE損失から復元精度を計算する方法に変更
+                    # 復元精度 = max(0, (1 - sqrt(MSE) / std) * 100)
+                    # std: データの標準偏差（約0.82）
+                    mse_loss = interval_loss.item()
+                    data_std = 0.82  # 正規化後の標準偏差（約0.82）
+                    rmse = np.sqrt(mse_loss)
+                    relative_rmse = rmse / data_std
+                    reconstruction_accuracy = max(0.0, (1.0 - relative_rmse) * 100.0)
                     all_reconstruction_accuracies.append(reconstruction_accuracy)
                 # 予測が間違っている場合は復元損失を計算しない（アプローチ2に従う）
     

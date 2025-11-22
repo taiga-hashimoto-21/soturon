@@ -65,23 +65,38 @@ class Task4BERT(nn.Module):
         # 出力ヘッド（各位置 → スカラー）
         self.output_head = nn.Linear(d_model, 1)
         
+        # 復元ヘッド（ノイズ検知した区間のみを復元）
+        # 区間の特徴（d_model次元）から100ポイントを復元
+        points_per_interval = seq_len // 30  # 30区間、1区間=100ポイント
+        self.reconstruction_head = nn.Sequential(
+            nn.Linear(d_model, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 512),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(512, points_per_interval)  # 100ポイントを復元
+        )
+        
         # アテンションウェイトを保存するためのリスト
         self.attention_weights_list = []
         
         # アテンションフック用のハンドル
         self.hooks = []
     
-    def forward(self, x, mask_positions, return_attention=False):
+    def forward(self, x, mask_positions, return_attention=False, num_intervals=30):
         """
         Args:
             x: (B, L) マスクされたPSDデータ
             mask_positions: (B, L) マスク位置 [True/False]
             return_attention: アテンションウェイトを返すかどうか
+            num_intervals: 区間数（デフォルト: 30）
         
         Returns:
-            out: (B, L) 予測されたPSDデータ
+            out: (B, L) 予測されたPSDデータ（マスク予測タスク用）
             cls_out: (B, d_model) CLSトークンの表現
             attention_weights: (B, n_heads, L+1, L+1) アテンションウェイト（return_attention=Trueの場合）
+            reconstructed_interval: (B, 100) 復元された区間（return_attention=Trueの場合のみ）
         """
         B, L = x.shape
         assert L == self.seq_len, f"seq_len mismatch: expected {self.seq_len}, got {L}"
@@ -145,8 +160,39 @@ class Task4BERT(nn.Module):
         # CLS も返す
         cls_out = encoded[0].transpose(0, 1)  # (B, d_model)
         
+        # 復元機能: アテンションウェイトからノイズ区間を検知して復元
+        reconstructed_interval = None
+        if return_attention and attention_weights is not None:
+            # CLSトークンから各区間へのアテンションを取得
+            cls_attention = self.get_cls_attention_to_intervals(attention_weights, num_intervals)  # (B, num_intervals)
+            
+            # 最もアテンションが低い区間をノイズ区間として検知
+            predicted_noise_intervals = cls_attention.argmin(dim=1)  # (B,) - 予測されたノイズ区間
+            
+            # 予測した区間の特徴を取得して復元
+            points_per_interval = self.seq_len // num_intervals
+            reconstructed_intervals_list = []
+            
+            for i in range(B):
+                predicted_interval = predicted_noise_intervals[i].item()
+                # 予測した区間の開始・終了インデックス
+                start_idx = predicted_interval * points_per_interval
+                end_idx = min(start_idx + points_per_interval, self.seq_len)
+                
+                # 予測した区間のエンコードされた特徴を取得
+                # encoded_seq: (B, L, d_model) から該当区間の特徴を取得
+                interval_features = encoded_seq[i, start_idx:end_idx, :]  # (points_per_interval, d_model)
+                # 区間の特徴を平均化（または最大値など）
+                interval_feature = interval_features.mean(dim=0)  # (d_model,)
+                
+                # 復元ヘッドで復元
+                reconstructed_interval_single = self.reconstruction_head(interval_feature.unsqueeze(0))  # (1, 100)
+                reconstructed_intervals_list.append(reconstructed_interval_single.squeeze(0))  # (100,)
+            
+            reconstructed_interval = torch.stack(reconstructed_intervals_list, dim=0)  # (B, 100)
+        
         if return_attention:
-            return out, cls_out, attention_weights
+            return out, cls_out, attention_weights, reconstructed_interval
         else:
             return out, cls_out
     

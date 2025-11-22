@@ -249,7 +249,11 @@ print(f"テストデータ: {len(test_indices):,}サンプル")
 
 # ラベルの分布を確認
 print("\nラベルの分布（訓練データ）:")
-label_counts = torch.bincount(train_labels)
+label_counts_full = torch.bincount(train_labels)
+# NUM_INTERVALSのサイズに合わせて拡張（存在しない区間は0）
+label_counts = torch.zeros(NUM_INTERVALS, dtype=torch.long)
+for i in range(min(NUM_INTERVALS, len(label_counts_full))):
+    label_counts[i] = label_counts_full[i]
 for i in range(NUM_INTERVALS):
     print(f"  区間 {i+1:2d}: {label_counts[i].item():4d}サンプル")
 

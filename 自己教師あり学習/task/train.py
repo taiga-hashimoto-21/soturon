@@ -32,23 +32,31 @@ def compute_loss(
     mask_positions,
     attention_weights,
     noise_intervals,
+    reconstructed_interval=None,
+    original_data=None,
     lambda_reg=0.1,
+    lambda_recon=1.0,
     num_intervals=30,
+    points_per_interval=100,
     margin=0.1,
     debug=False,
     batch_idx=0,
 ):
     """
-    損失関数を計算（ランキング損失を使用）
+    損失関数を計算（ランキング損失 + 復元損失）
     
     Args:
-        predictions: (B, L) 予測されたPSDデータ
+        predictions: (B, L) 予測されたPSDデータ（マスク予測タスク用）
         targets: (B, L) ノイズが付与されたPSDデータ（マスクなし）
         mask_positions: (B, L) マスク位置
         attention_weights: (B, n_heads, L+1, L+1) アテンションウェイト
-        noise_intervals: (B,) ノイズ区間のインデックス
+        noise_intervals: (B,) ノイズ区間のインデックス（真の値）
+        reconstructed_interval: (B, 100) 復元された区間（Noneの場合は計算しない）
+        original_data: (B, L) 元のデータ（ノイズ付与前、Noneの場合は計算しない）
         lambda_reg: 正則化項の重み
+        lambda_recon: 復元損失の重み
         num_intervals: 区間数
+        points_per_interval: 1区間あたりのポイント数
         margin: ランキング損失のマージン
         debug: デバッグ情報を出力するか
         batch_idx: バッチインデックス（デバッグ用）
@@ -57,6 +65,7 @@ def compute_loss(
         total_loss: 総損失
         mask_loss: マスク予測損失
         reg_loss: ランキング損失
+        recon_loss: 復元損失（Noneの場合は計算されない）
     """
     # 1. マスク予測損失
     if mask_positions.any():
@@ -198,10 +207,74 @@ def compute_loss(
                 print(f"  margin: {margin}")
                 print("=" * 60)
     
-    # 3. 総損失
-    total_loss = mask_loss + reg_loss
+    # 3. 復元損失（ノイズ検知が正しい場合のみ計算 - アプローチ2）
+    recon_loss = None
+    if reconstructed_interval is not None and original_data is not None:
+        B = predictions.shape[0]
+        L = predictions.shape[1]
+        
+        # アテンションウェイトからノイズ区間を予測
+        if attention_weights is not None:
+            # CLSトークンから各区間へのアテンションを取得
+            cls_attention_full = attention_weights[:, :, 0, 1:]  # (B, n_heads, L)
+            cls_attention_mean = cls_attention_full.mean(dim=1)  # (B, L)
+            
+            # 区間ごとのアテンションを計算
+            interval_attention_list = []
+            for i in range(B):
+                interval_attn = []
+                for j in range(num_intervals):
+                    start_idx = j * points_per_interval
+                    end_idx = min(start_idx + points_per_interval, L)
+                    attn = cls_attention_mean[i, start_idx:end_idx].mean()
+                    interval_attn.append(attn)
+                interval_attention_list.append(torch.stack(interval_attn))
+            
+            interval_attention = torch.stack(interval_attention_list)  # (B, num_intervals)
+            
+            # 最もアテンションが低い区間をノイズ区間として予測
+            predicted_noise_intervals = interval_attention.argmin(dim=1)  # (B,)
+            
+            # 復元損失を計算（予測が正しい場合のみ）
+            reconstruction_losses = []
+            for i in range(B):
+                pred_interval = predicted_noise_intervals[i].item()
+                true_interval = noise_intervals[i].item()
+                
+                # 予測が正しい場合のみ復元損失を計算（アプローチ2）
+                if pred_interval == true_interval:
+                    # 真のノイズ区間のインデックス範囲を計算
+                    start_idx = true_interval * points_per_interval
+                    end_idx = min(start_idx + points_per_interval, L)
+                    
+                    # 復元した区間と元のデータを比較
+                    pred_reconstructed = reconstructed_interval[i]  # (100,)
+                    true_original = original_data[i, start_idx:end_idx]  # (100,)
+                    
+                    # MSE損失
+                    interval_loss = F.mse_loss(pred_reconstructed, true_original)
+                    reconstruction_losses.append(interval_loss)
+            
+            if len(reconstruction_losses) > 0:
+                recon_loss = lambda_recon * torch.stack(reconstruction_losses).mean()
+            else:
+                recon_loss = torch.tensor(0.0, device=predictions.device)
+            
+            if debug and batch_idx == 0:
+                print(f"\n復元損失の統計:")
+                print(f"  予測が正しいサンプル数: {len(reconstruction_losses)} / {B}")
+                if len(reconstruction_losses) > 0:
+                    print(f"  平均復元損失: {torch.stack(reconstruction_losses).mean().item():.6f}")
+                    print(f"  lambda_recon: {lambda_recon}")
+                    print(f"  recon_loss (lambda_recon * avg): {recon_loss.item():.6f}")
     
-    return total_loss, mask_loss, reg_loss
+    # 4. 総損失
+    if recon_loss is not None:
+        total_loss = mask_loss + reg_loss + recon_loss
+    else:
+        total_loss = mask_loss + reg_loss
+    
+    return total_loss, mask_loss, reg_loss, recon_loss
 
 
 def train_task4(
@@ -294,7 +367,9 @@ def train_task4(
     train_losses = []
     train_mask_losses = []
     train_reg_losses = []
+    train_recon_losses = []
     val_losses = []
+    val_recon_losses = []
     best_val_loss = float("inf")
     best_train_loss = float("inf")
     
@@ -308,7 +383,9 @@ def train_task4(
         train_losses = checkpoint["train_losses"]
         train_mask_losses = checkpoint.get("train_mask_losses", [])
         train_reg_losses = checkpoint.get("train_reg_losses", [])
+        train_recon_losses = checkpoint.get("train_recon_losses", [])
         val_losses = checkpoint["val_losses"]
+        val_recon_losses = checkpoint.get("val_recon_losses", [])
         best_val_loss = checkpoint.get("best_val_loss", float("inf"))
         best_train_loss = checkpoint.get("best_train_loss", float("inf"))
         print(f"Resumed from epoch {start_epoch}")
@@ -320,24 +397,41 @@ def train_task4(
         running_train_loss = 0.0
         running_mask_loss = 0.0
         running_reg_loss = 0.0
+        running_recon_loss = 0.0
         
         for batch_idx, batch in enumerate(train_loader):
             x = batch["input"].to(device)
             y = batch["target"].to(device)
             m = batch["mask"].to(device)
             noise_intervals = batch["noise_interval"].to(device)
+            original_data = batch.get("original", None)  # 元のデータ（ノイズ付与前）
+            if original_data is not None:
+                original_data = original_data.to(device)
             
             optimizer.zero_grad()
             
             with autocast(enabled=(device == "cuda")):
-                pred, cls_out, attention_weights = model(x, m, return_attention=True)
+                # 復元機能を使う場合はreturn_attention=Trueで復元結果も取得
+                if original_data is not None:
+                    pred, cls_out, attention_weights, reconstructed_interval = model(
+                        x, m, return_attention=True, num_intervals=num_intervals
+                    )
+                else:
+                    pred, cls_out, attention_weights = model(x, m, return_attention=True)
+                    reconstructed_interval = None
                 
                 # 最初のバッチのみデバッグ情報を出力
                 debug_flag = (epoch == start_epoch and batch_idx == 0)
                 
-                total_loss, mask_loss, reg_loss = compute_loss(
+                total_loss, mask_loss, reg_loss, recon_loss = compute_loss(
                     pred, y, m, attention_weights, noise_intervals,
-                    lambda_reg=lambda_reg, num_intervals=num_intervals, margin=margin,
+                    reconstructed_interval=reconstructed_interval,
+                    original_data=original_data,
+                    lambda_reg=lambda_reg,
+                    lambda_recon=1.0,  # 復元損失の重み
+                    num_intervals=num_intervals,
+                    points_per_interval=seq_len // num_intervals,
+                    margin=margin,
                     debug=debug_flag, batch_idx=batch_idx
                 )
             
@@ -351,19 +445,24 @@ def train_task4(
             running_train_loss += total_loss.item() * x.size(0)
             running_mask_loss += mask_loss.item() * x.size(0)
             running_reg_loss += reg_loss.item() * x.size(0)
+            if recon_loss is not None:
+                running_recon_loss += recon_loss.item() * x.size(0)
         
         train_loss = running_train_loss / len(train_loader.dataset)
         train_mask_loss = running_mask_loss / len(train_loader.dataset)
         train_reg_loss = running_reg_loss / len(train_loader.dataset)
+        train_recon_loss = running_recon_loss / len(train_loader.dataset) if running_recon_loss > 0 else 0.0
         
         train_losses.append(train_loss)
         train_mask_losses.append(train_mask_loss)
         train_reg_losses.append(train_reg_loss)
+        train_recon_losses.append(train_recon_loss)
         
         # Validation
         if val_loader is not None:
             model.eval()
             running_val_loss = 0.0
+            running_val_recon_loss = 0.0
             
             with torch.no_grad():
                 for batch in val_loader:
@@ -372,39 +471,79 @@ def train_task4(
                     m = batch["mask"].to(device)
                     noise_intervals = batch["noise_interval"].to(device)
                     
+                    original_data = batch.get("original", None)
+                    if original_data is not None:
+                        original_data = original_data.to(device)
+                    
                     with autocast(enabled=(device == "cuda")):
-                        pred, cls_out, attention_weights = model(x, m, return_attention=True)
-                        total_loss, _, _ = compute_loss(
+                        if original_data is not None:
+                            pred, cls_out, attention_weights, reconstructed_interval = model(
+                                x, m, return_attention=True, num_intervals=num_intervals
+                            )
+                        else:
+                            pred, cls_out, attention_weights = model(x, m, return_attention=True)
+                            reconstructed_interval = None
+                        
+                        total_loss, _, _, recon_loss = compute_loss(
                             pred, y, m, attention_weights, noise_intervals,
-                            lambda_reg=lambda_reg, num_intervals=num_intervals, margin=margin
+                            reconstructed_interval=reconstructed_interval,
+                            original_data=original_data,
+                            lambda_reg=lambda_reg,
+                            lambda_recon=1.0,
+                            num_intervals=num_intervals,
+                            points_per_interval=seq_len // num_intervals,
+                            margin=margin
                         )
                     
                     running_val_loss += total_loss.item() * x.size(0)
+                    if recon_loss is not None:
+                        running_val_recon_loss += recon_loss.item() * x.size(0)
             
             val_loss = running_val_loss / len(val_loader.dataset)
+            val_recon_loss = running_val_recon_loss / len(val_loader.dataset) if running_val_recon_loss > 0 else 0.0
             val_losses.append(val_loss)
+            val_recon_losses.append(val_recon_loss)
         else:
             val_loss = None
+            val_recon_loss = None
         
         scheduler.step()
         
         # ログ出力
         if val_loss is not None:
-            print(
-                f"Epoch {epoch+1}/{num_epochs} "
-                f"Train Loss: {train_loss:.6f} "
-                f"(Mask: {train_mask_loss:.6f}, Reg: {train_reg_loss:.6f}) "
-                f"Val Loss: {val_loss:.6f} "
-                f"LR: {scheduler.get_last_lr()[0]:.6e}"
-            )
+            if train_recon_loss > 0:
+                print(
+                    f"Epoch {epoch+1}/{num_epochs} "
+                    f"Train Loss: {train_loss:.6f} "
+                    f"(Mask: {train_mask_loss:.6f}, Reg: {train_reg_loss:.6f}, Recon: {train_recon_loss:.6f}) "
+                    f"Val Loss: {val_loss:.6f} "
+                    f"LR: {scheduler.get_last_lr()[0]:.6e}"
+                )
+            else:
+                print(
+                    f"Epoch {epoch+1}/{num_epochs} "
+                    f"Train Loss: {train_loss:.6f} "
+                    f"(Mask: {train_mask_loss:.6f}, Reg: {train_reg_loss:.6f}) "
+                    f"Val Loss: {val_loss:.6f} "
+                    f"LR: {scheduler.get_last_lr()[0]:.6e}"
+                )
         else:
-            print(
-                f"Epoch {epoch+1}/{num_epochs} "
-                f"Train Loss: {train_loss:.6f} "
-                f"(Mask: {train_mask_loss:.6f}, Reg: {train_reg_loss:.6f}) "
-                f"(no validation) "
-                f"LR: {scheduler.get_last_lr()[0]:.6e}"
-            )
+            if train_recon_loss > 0:
+                print(
+                    f"Epoch {epoch+1}/{num_epochs} "
+                    f"Train Loss: {train_loss:.6f} "
+                    f"(Mask: {train_mask_loss:.6f}, Reg: {train_reg_loss:.6f}, Recon: {train_recon_loss:.6f}) "
+                    f"(no validation) "
+                    f"LR: {scheduler.get_last_lr()[0]:.6e}"
+                )
+            else:
+                print(
+                    f"Epoch {epoch+1}/{num_epochs} "
+                    f"Train Loss: {train_loss:.6f} "
+                    f"(Mask: {train_mask_loss:.6f}, Reg: {train_reg_loss:.6f}) "
+                    f"(no validation) "
+                    f"LR: {scheduler.get_last_lr()[0]:.6e}"
+                )
         
         # best model 保存
         if train_loss < best_train_loss:
@@ -426,7 +565,9 @@ def train_task4(
                 "train_losses": train_losses,
                 "train_mask_losses": train_mask_losses,
                 "train_reg_losses": train_reg_losses,
+                "train_recon_losses": train_recon_losses,
                 "val_losses": val_losses,
+                "val_recon_losses": val_recon_losses,
                 "best_val_loss": best_val_loss,
                 "best_train_loss": best_train_loss,
             },
@@ -481,15 +622,19 @@ def train_task4(
         pickle.dump(train_losses, f)
     with open(os.path.join(out_dir, "val_losses.pkl"), "wb") as f:
         pickle.dump(val_losses, f)
+    with open(os.path.join(out_dir, "train_recon_losses.pkl"), "wb") as f:
+        pickle.dump(train_recon_losses, f)
+    with open(os.path.join(out_dir, "val_recon_losses.pkl"), "wb") as f:
+        pickle.dump(val_recon_losses, f)
     
-    return model, train_losses, val_losses, best_val_loss
+    return model, train_losses, val_losses, best_val_loss, train_recon_losses, val_recon_losses
 
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
     
-    model, train_losses, val_losses, best_val_loss = train_task4(
+    model, train_losses, val_losses, best_val_loss, train_recon_losses, val_recon_losses = train_task4(
         pickle_path="data_lowF_noise.pickle",
         batch_size=16,  # 8 → 16に増やして速度向上
         num_epochs=10,  # 一旦10エポックに設定

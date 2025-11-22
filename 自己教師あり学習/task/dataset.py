@@ -349,11 +349,14 @@ class Task4Dataset(Dataset):
             masked_noisy_psd_norm = noisy_psd_norm.clone()
             masked_noisy_psd_norm[mask_positions] = 0.0
             
+            # 固定データセットには元のデータがないため、targetを元のデータとして使用
+            # （固定データセットは評価用なので、復元損失は計算しない）
             return {
                 'input': torch.tensor(masked_noisy_psd_norm, dtype=torch.float32),
                 'target': torch.tensor(noisy_psd_norm, dtype=torch.float32),
                 'mask': torch.tensor(mask_positions, dtype=torch.bool),
                 'noise_interval': torch.tensor(noise_interval, dtype=torch.long),
+                'original': None,  # 固定データセットでは元のデータは利用不可
             }
         
         # 動的にデータを生成（学習時）
@@ -467,10 +470,17 @@ class Task4Dataset(Dataset):
         noisy_psd_norm = (noisy_psd_log - self.normalization_mean) / (self.normalization_std + 1e-8)
         masked_noisy_psd_norm = (masked_noisy_psd_log - self.normalization_mean) / (self.normalization_std + 1e-8)
         
+        # 元のデータ（構造化ノイズ付与後、区間ノイズ付与前）も前処理して返す
+        original_psd_scaled = structured_noisy_psd.numpy() * self.scale_factor
+        original_psd_scaled = np.maximum(original_psd_scaled, 1e-30)
+        original_psd_log = np.log(original_psd_scaled)
+        original_psd_norm = (original_psd_log - self.normalization_mean) / (self.normalization_std + 1e-8)
+        
         return {
             'input': torch.tensor(masked_noisy_psd_norm, dtype=torch.float32),
             'target': torch.tensor(noisy_psd_norm, dtype=torch.float32),
             'mask': torch.tensor(mask_positions, dtype=torch.bool),
             'noise_interval': torch.tensor(noise_interval, dtype=torch.long),
+            'original': torch.tensor(original_psd_norm, dtype=torch.float32),  # 元のデータ（ノイズ付与前）
         }
 
