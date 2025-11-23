@@ -164,10 +164,10 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
                     
                     cls_attention = torch.stack(cls_attention_intervals, dim=1)  # (B, num_intervals)
                 
-                # 学習時と同じスケーリングを適用（train.pyと一致させる）
+                # 学習時と同じ処理を適用（train.pyと一致させる）
+                # 重要: 学習時はスケーリングしていない（train.py 117-129行目を参照）
+                # スケーリングせずに、そのまま正規化する
                 if cls_attention is not None:
-                    attention_scale = 100.0  # train.pyと同じ値（10000 → 100に変更）
-                    cls_attention = cls_attention * attention_scale
                     all_attention_weights.append(cls_attention.cpu())
                     all_labels.append(labels.cpu())
     
@@ -178,23 +178,36 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
     all_attention = torch.cat(all_attention_weights, dim=0).numpy()
     all_labels = torch.cat(all_labels, dim=0).numpy()
     
-    # デバッグ: アテンションウェイトの統計情報を表示
-    print(f"\nアテンションウェイトの統計情報:")
-    print(f"  形状: {all_attention.shape}")
-    print(f"  最小値: {all_attention.min():.6f}")
-    print(f"  最大値: {all_attention.max():.6f}")
-    print(f"  平均値: {all_attention.mean():.6f}")
-    print(f"  標準偏差: {all_attention.std():.6f}")
+    # 学習時と同じ正規化を適用（train.pyと一致させる）
+    # train.pyでは interval_attention_normalized = F.normalize(interval_attention, p=1, dim=1) を使用
+    # 評価時も同じ正規化を適用する必要がある
+    from scipy.linalg import norm
+    all_attention_normalized = np.zeros_like(all_attention)
+    for i in range(len(all_labels)):
+        # L1正規化（p=1, dim=1に相当）
+        row_sum = np.sum(np.abs(all_attention[i]))
+        if row_sum > 0:
+            all_attention_normalized[i] = all_attention[i] / row_sum
+        else:
+            all_attention_normalized[i] = all_attention[i]
+    
+    # デバッグ: アテンションウェイトの統計情報を表示（正規化後）
+    print(f"\nアテンションウェイトの統計情報（正規化後）:")
+    print(f"  形状: {all_attention_normalized.shape}")
+    print(f"  最小値: {all_attention_normalized.min():.6f}")
+    print(f"  最大値: {all_attention_normalized.max():.6f}")
+    print(f"  平均値: {all_attention_normalized.mean():.6f}")
+    print(f"  標準偏差: {all_attention_normalized.std():.6f}")
     print(f"  サンプル数: {len(all_labels)}")
     
-    # GitHubリポジトリと同じ評価方法（閾値最適化）
-    # ノイズ区間と正常区間のアテンションウェイトを比較
+    # 評価方法: 常に「最もアテンションが低い区間」を予測（argmin()を使用）
+    # ノイズ区間と正常区間のアテンションウェイトを比較（正規化後）
     noise_attention = []
     normal_attention = []
     for i, label in enumerate(all_labels):
-        noise_attention.append(all_attention[i, label])
+        noise_attention.append(all_attention_normalized[i, label])
         normal_indices = [j for j in range(num_intervals) if j != label]
-        normal_attention.append(all_attention[i, normal_indices].mean())
+        normal_attention.append(all_attention_normalized[i, normal_indices].mean())
     
     noise_attention = np.array(noise_attention)
     normal_attention = np.array(normal_attention)
@@ -202,67 +215,54 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
     # アテンションウェイトの平均値比較
     attention_diff = normal_attention.mean() - noise_attention.mean()
     
-    print(f"\n区間別アテンションウェイト:")
+    print(f"\n区間別アテンションウェイト（正規化後）:")
     print(f"  ノイズ区間の平均: {noise_attention.mean():.6f} (最小: {noise_attention.min():.6f}, 最大: {noise_attention.max():.6f})")
     print(f"  正常区間の平均: {normal_attention.mean():.6f} (最小: {normal_attention.min():.6f}, 最大: {normal_attention.max():.6f})")
     print(f"  差（正常 - ノイズ）: {attention_diff:.6f}")
     
-    # 閾値を最適化（F1-scoreが最大になる閾値を選択）
+    # 予測方法: 常に「最もアテンションが低い区間」を予測（argmin()を使用）
     # 設計意図: ノイズ区間のアテンション < 正常区間のアテンション
     # → アテンションが低い区間をノイズと判定
-    print("閾値を最適化中...")
-    thresholds = np.linspace(all_attention.min(), all_attention.max(), 50)  # 100 → 50に減らす
-    best_threshold = None
-    best_f1 = 0
-    best_accuracy = 0
+    # 学習時と同じ方法を使用（interval_attention_normalized.argmin()）
+    # 閾値は使用しない（常にargmin()で予測）
+    # 重要: 正規化後のアテンションウェイトを使用する
+    print("予測を実行中（最もアテンションが低い区間を予測、argmin()を使用、正規化後）...")
+    final_predictions = np.array([np.argmin(all_attention_normalized[i]) for i in range(len(all_labels))])
     
-    for idx, threshold in enumerate(thresholds):
-        if idx % 10 == 0:
-            print(f"  閾値 {idx}/{len(thresholds)} を評価中...")
-        # 各サンプルで、閾値以下の区間を「ノイズあり」と判定
-        predictions = []
-        for i in range(len(all_labels)):
-            noisy_intervals = np.where(all_attention[i] < threshold)[0]
-            if len(noisy_intervals) > 0:
-                # 最もアテンションウェイトが低い区間を予測
-                predictions.append(noisy_intervals[np.argmin(all_attention[i, noisy_intervals])])
-            else:
-                # 閾値以下の区間がない場合、最もアテンションウェイトが低い区間を予測
-                predictions.append(np.argmin(all_attention[i]))
-        
-        predictions = np.array(predictions)
-        f1 = f1_score(all_labels, predictions, average='macro', zero_division=0)
-        accuracy = accuracy_score(all_labels, predictions)
-        
-        if f1 > best_f1:
-            best_f1 = f1
-            best_threshold = threshold
-            best_accuracy = accuracy
+    # デバッグ: 予測の分布を確認
+    unique_predictions, prediction_counts = np.unique(final_predictions, return_counts=True)
+    unique_labels, label_counts = np.unique(all_labels, return_counts=True)
+    print(f"\n予測の分布:")
+    print(f"  予測された区間: {unique_predictions[:10]}... (最初の10個)")
+    print(f"  予測の頻度: {prediction_counts[:10]}... (最初の10個)")
+    print(f"  最も多く予測された区間: {unique_predictions[np.argmax(prediction_counts)]} (頻度: {np.max(prediction_counts)})")
+    print(f"\n正解の分布:")
+    print(f"  正解区間: {unique_labels[:10]}... (最初の10個)")
+    print(f"  正解の頻度: {label_counts[:10]}... (最初の10個)")
+    print(f"  最も多い正解区間: {unique_labels[np.argmax(label_counts)]} (頻度: {np.max(label_counts)})")
     
-    # best_thresholdがNoneの場合のフォールバック処理
-    if best_threshold is None:
-        print("警告: 最適な閾値が見つかりませんでした。デフォルトの方法を使用します。")
-        # 最もアテンションウェイトが低い区間を予測する方法にフォールバック
-        final_predictions = np.array([np.argmin(all_attention[i]) for i in range(len(all_labels))])
-        best_threshold = all_attention.mean()  # 平均値をデフォルト閾値として設定
-        best_f1 = f1_score(all_labels, final_predictions, average='macro', zero_division=0)
-        best_accuracy = accuracy_score(all_labels, final_predictions)
-    else:
-        # 最適な閾値で最終予測
-        final_predictions = []
-        for i in range(len(all_labels)):
-            noisy_intervals = np.where(all_attention[i] < best_threshold)[0]
-            if len(noisy_intervals) > 0:
-                final_predictions.append(noisy_intervals[np.argmin(all_attention[i, noisy_intervals])])
-            else:
-                final_predictions.append(np.argmin(all_attention[i]))
-        final_predictions = np.array(final_predictions)
+    # 最初の10サンプルの詳細を表示
+    print(f"\n最初の10サンプルの詳細:")
+    for i in range(min(10, len(all_labels))):
+        pred_interval = final_predictions[i]
+        true_interval = all_labels[i]
+        pred_attention = all_attention_normalized[i, pred_interval]
+        true_attention = all_attention_normalized[i, true_interval]
+        is_correct = "✓" if pred_interval == true_interval else "✗"
+        print(f"  サンプル {i}: 予測={pred_interval}, 正解={true_interval}, "
+              f"予測アテンション={pred_attention:.6f}, 正解アテンション={true_attention:.6f} {is_correct}")
+    
+    # 評価指標を計算
+    best_f1 = f1_score(all_labels, final_predictions, average='macro', zero_division=0)
+    best_accuracy = accuracy_score(all_labels, final_predictions)
+    best_threshold = None  # 閾値は使用しない
     
     # baselineと同じ方法: CrossEntropyLossで評価
     # アテンションウェイトからlogitsを生成（最もアテンションウェイトが低い区間がノイズ）
     # アテンションウェイトが低いほど、ノイズの可能性が高い
     # logits = -attention_weights（アテンションウェイトが低いほどスコアが高い）
-    attention_logits = -all_attention  # (N, num_intervals)
+    # 重要: 正規化後のアテンションウェイトを使用する
+    attention_logits = -all_attention_normalized  # (N, num_intervals)
     
     # CrossEntropyLossで評価（baselineと同じ方法）
     criterion = nn.CrossEntropyLoss()
@@ -279,26 +279,43 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
     
     # ROC-AUC（二値分類として扱う）
     # アテンションウェイトが低いほどノイズの可能性が高い
+    # 重要: 正規化後のアテンションウェイトを使用する
     y_true_binary = []
     y_score_binary = []
     for i, label in enumerate(all_labels):
         y_true_binary.append(1)  # ノイズ区間
-        y_score_binary.append(1 - all_attention[i, label])  # アテンションウェイトが低いほどスコアが高い
+        y_score_binary.append(1 - all_attention_normalized[i, label])  # アテンションウェイトが低いほどスコアが高い
         for j in range(num_intervals):
             if j != label:
                 y_true_binary.append(0)  # 正常区間
-                y_score_binary.append(1 - all_attention[i, j])
+                y_score_binary.append(1 - all_attention_normalized[i, j])
     
     try:
         roc_auc = roc_auc_score(y_true_binary, y_score_binary)
     except:
         roc_auc = 0.0
     
-    # 復元損失を計算（ノイズ検知した区間の復元精度）
-    # データローダーを再度ループして復元損失を計算
+    # 3つのタスクの評価:
+    # 1. マスク予測（15%マスクしたところの復元）
+    # 2. ノイズ区間の予測（上で計算済み）
+    # 3. ノイズ区間の復元
+    # データローダーを再度ループして評価を計算
     model.eval()
+    
+    # タスク1: マスク予測の評価
+    all_mask_prediction_losses = []
+    all_mask_prediction_accuracies = []
+    
+    # タスク3: ノイズ区間の復元の評価
     all_reconstruction_losses = []
     all_reconstruction_accuracies = []
+    all_reconstruction_losses_when_correct = []  # 予測が正しい場合
+    all_reconstruction_losses_when_incorrect = []  # 予測が間違った場合
+    all_reconstruction_accuracies_when_correct = []
+    all_reconstruction_accuracies_when_incorrect = []
+    num_correct_predictions = 0
+    num_incorrect_predictions = 0
+    
     points_per_interval = 3000 // num_intervals  # 100ポイント
     
     with torch.no_grad():
@@ -315,11 +332,26 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
             original_data = original_data.to(device)
             
             # モデルの出力（復元機能付き）
-            _, _, attention_weights, reconstructed_interval, reconstructed_intervals_info = model(
+            pred, _, attention_weights, reconstructed_interval, reconstructed_intervals_info = model(
                 x, mask, return_attention=True, num_intervals=num_intervals
             )
+            # pred: (B, L) マスク予測の結果
             # reconstructed_interval: (B, max_length) - 予測区間±2区間（最大500ポイント）
             # reconstructed_intervals_info: (B, 3) - [start_interval, end_interval, predicted_interval]
+            
+            # タスク1: マスク予測の評価（15%マスクしたところの復元）
+            if mask.any():
+                # マスク位置でのMSE損失
+                mask_prediction_loss = F.mse_loss(pred[mask], x[mask])  # マスク位置での予測と入力の比較
+                all_mask_prediction_losses.append(mask_prediction_loss.item())
+                
+                # マスク予測精度（相対誤差から計算）
+                mask_pred_mse = mask_prediction_loss.item()
+                data_std = 0.82
+                mask_pred_rmse = np.sqrt(mask_pred_mse)
+                mask_pred_relative_rmse = mask_pred_rmse / data_std
+                mask_prediction_accuracy = max(0.0, (1.0 - mask_pred_relative_rmse) * 100.0)
+                all_mask_prediction_accuracies.append(mask_prediction_accuracy)
             
             if reconstructed_interval is None:
                 continue
@@ -350,47 +382,53 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
                 # 最もアテンションが低い区間をノイズ区間として予測
                 predicted_noise_intervals = cls_attention.argmin(dim=1)  # (B,)
                 
-                # 復元損失を計算（予測が正しい場合のみ - アプローチ2）
+                # タスク3: ノイズ区間の復元の評価（予測が正しい場合と間違った場合を分けて計算）
                 for i in range(x.size(0)):
                     pred_interval = predicted_noise_intervals[i].item()
                     true_interval = noise_intervals[i].item()
                     
-                    # 予測が正しい場合のみ復元損失を計算
+                    # 復元範囲の情報を取得
+                    start_interval = reconstructed_intervals_info[i, 0].item()
+                    end_interval = reconstructed_intervals_info[i, 1].item()
+                    
+                    # 復元されたデータを取得（パディングを除く）
+                    num_intervals_reconstructed = end_interval - start_interval + 1
+                    reconstructed_length = num_intervals_reconstructed * points_per_interval
+                    pred_reconstructed = reconstructed_interval[i, :reconstructed_length]  # (reconstructed_length,)
+                    
+                    # 正解データも同じ範囲を取得（真のノイズ区間±2区間）
+                    true_start_idx = start_interval * points_per_interval
+                    true_end_idx = min((end_interval + 1) * points_per_interval, original_data.size(1))
+                    true_original = original_data[i, true_start_idx:true_end_idx]  # (reconstructed_length,)
+                    
+                    # 長さが一致することを確認
+                    min_length = min(pred_reconstructed.shape[0], true_original.shape[0])
+                    pred_reconstructed = pred_reconstructed[:min_length]
+                    true_original = true_original[:min_length]
+                    
+                    # MSE損失
+                    interval_loss = F.mse_loss(pred_reconstructed, true_original)
+                    
+                    # 復元精度（%）を計算
+                    mse_loss = interval_loss.item()
+                    data_std = 0.82  # 正規化後の標準偏差（約0.82）
+                    rmse = np.sqrt(mse_loss)
+                    relative_rmse = rmse / data_std
+                    reconstruction_accuracy = max(0.0, (1.0 - relative_rmse) * 100.0)
+                    
+                    # 予測が正しい場合と間違った場合を分けて記録
                     if pred_interval == true_interval:
-                        # 復元範囲の情報を取得
-                        start_interval = reconstructed_intervals_info[i, 0].item()
-                        end_interval = reconstructed_intervals_info[i, 1].item()
-                        
-                        # 復元されたデータを取得（パディングを除く）
-                        num_intervals_reconstructed = end_interval - start_interval + 1
-                        reconstructed_length = num_intervals_reconstructed * points_per_interval
-                        pred_reconstructed = reconstructed_interval[i, :reconstructed_length]  # (reconstructed_length,)
-                        
-                        # 正解データも同じ範囲を取得
-                        true_start_idx = start_interval * points_per_interval
-                        true_end_idx = min((end_interval + 1) * points_per_interval, original_data.size(1))
-                        true_original = original_data[i, true_start_idx:true_end_idx]  # (reconstructed_length,)
-                        
-                        # 長さが一致することを確認
-                        min_length = min(pred_reconstructed.shape[0], true_original.shape[0])
-                        pred_reconstructed = pred_reconstructed[:min_length]
-                        true_original = true_original[:min_length]
-                        
-                        # MSE損失
-                        interval_loss = F.mse_loss(pred_reconstructed, true_original)
-                        all_reconstruction_losses.append(interval_loss.item())
-                        
-                        # 復元精度（%）を計算
-                        # 正規化されたデータでは相対誤差が厳しすぎるため、
-                        # MSE損失から復元精度を計算する方法に変更
-                        # 復元精度 = max(0, (1 - sqrt(MSE) / std) * 100)
-                        # std: データの標準偏差（約0.82）
-                        mse_loss = interval_loss.item()
-                        data_std = 0.82  # 正規化後の標準偏差（約0.82）
-                        rmse = np.sqrt(mse_loss)
-                        relative_rmse = rmse / data_std
-                        reconstruction_accuracy = max(0.0, (1.0 - relative_rmse) * 100.0)
-                        all_reconstruction_accuracies.append(reconstruction_accuracy)
+                        all_reconstruction_losses_when_correct.append(mse_loss)
+                        all_reconstruction_accuracies_when_correct.append(reconstruction_accuracy)
+                        num_correct_predictions += 1
+                    else:
+                        all_reconstruction_losses_when_incorrect.append(mse_loss)
+                        all_reconstruction_accuracies_when_incorrect.append(reconstruction_accuracy)
+                        num_incorrect_predictions += 1
+                    
+                    # すべてのサンプルで復元損失を記録（予測が正しいかどうかに関わらず）
+                    all_reconstruction_losses.append(mse_loss)
+                    all_reconstruction_accuracies.append(reconstruction_accuracy)
     
     # 復元損失の平均
     if len(all_reconstruction_losses) > 0:
@@ -421,7 +459,7 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
         'normal_attention_mean': normal_attention.mean(),
         'predictions': final_predictions,
         'labels': all_labels,
-        'attention_weights': all_attention,
+        'attention_weights': all_attention_normalized,  # 正規化後のアテンションウェイト（学習時と同じ）
     }
 
 
@@ -716,8 +754,10 @@ def compare_methods(baseline_results, ssl_results):
     if 'attention_diff' in ssl_results:
         print(f"  アテンションウェイトの差: {ssl_results['attention_diff']:.4f}")
         print(f"    (正常区間 - ノイズ区間)")
-    if 'best_threshold' in ssl_results:
+    if 'best_threshold' in ssl_results and ssl_results['best_threshold'] is not None:
         print(f"  最適閾値: {ssl_results['best_threshold']:.6f}")
+    else:
+        print(f"  予測方法: 最もアテンションが低い区間を予測（閾値なし）")
     if 'noise_attention_mean' in ssl_results:
         print(f"  ノイズ区間の平均アテンション: {ssl_results['noise_attention_mean']:.6f}")
     if 'normal_attention_mean' in ssl_results:

@@ -448,11 +448,17 @@ class Task4Dataset(Dataset):
             noise_strength = np.abs(interval_noise).mean()
             noise_strength_per_interval.append(noise_strength)
         
-        # 正規化（合計=1）
+        # 正規化前にスケーリングを適用して差を拡大（方法3）
+        # ノイズ強度の差を拡大するために、べき乗を適用
         noise_strength_per_interval = np.array(noise_strength_per_interval, dtype=np.float32)
-        total_strength = noise_strength_per_interval.sum()
+        # べき乗を適用（2乗や3乗で差を拡大）
+        power_scale = 2.0  # 2乗で差を拡大
+        noise_strength_per_interval_scaled = np.power(noise_strength_per_interval + 1e-10, power_scale)
+        
+        # 正規化（合計=1）
+        total_strength = noise_strength_per_interval_scaled.sum()
         if total_strength > 1e-10:  # ゼロ除算を防ぐ
-            normalized_noise_strength = noise_strength_per_interval / total_strength
+            normalized_noise_strength = noise_strength_per_interval_scaled / total_strength
         else:
             # ノイズがほとんどない場合は均等に
             normalized_noise_strength = np.ones(self.num_intervals, dtype=np.float32) / self.num_intervals
