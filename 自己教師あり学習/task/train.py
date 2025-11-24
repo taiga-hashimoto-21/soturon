@@ -39,6 +39,7 @@ def compute_loss(
     original_data=None,
     lambda_reg=0.1,
     lambda_recon=1.0,
+    lambda_recon_correct=2.0,  # 予測が正しい場合の復元損失の重み（予測が外れた場合のlambda_reconより大きく設定）
     lambda_mask=1.0,  # マスク予測損失の重み（予測精度を上げるために重要）
     lambda_noise_interval=10.0,  # ノイズ区間予測損失の重み（ノイズ区間を特定するために重要）
     lambda_ranking=10.0,  # ランキング損失の重み（ノイズ区間のアテンション < 正常区間の最小アテンションを保証）
@@ -178,23 +179,63 @@ def compute_loss(
                 target_noise_interval_attention
             )
             
-            # 5. ランキング損失: ノイズ区間のアテンション < 正常区間の最小アテンション になるように学習
+            # 5. ランキング損失: 添付画像の数式を使用
+            # L_rank(A, Y_dot) = Σ (1 - Y_dot_ij * Y_dot_ik) * max(m, Y_dot_ij * a_ij + Y_dot_ik * a_ik)
+            # Y_dot_ij = -1 if Y_hat_i = Y_hat_j, +1 if Y_hat_i ≠ Y_hat_j
             ranking_loss = torch.tensor(0.0, device=predictions.device)
-            for i in range(B):
-                noise_idx = noise_intervals[i].item()
-                noise_attn = interval_attention[i, noise_idx]  # 正規化前
+            for b in range(B):
+                noise_idx = noise_intervals[b].item()
+                attns = interval_attention[b]  # (num_intervals,) 正規化前のアテンション値
                 
-                # 正常区間のインデックスを取得
-                normal_indices = [j for j in range(num_intervals) if j != noise_idx]
-                normal_attns = interval_attention[i, normal_indices]  # 正常区間のアテンション
-                normal_min_attn = normal_attns.min()  # 正常区間の最小アテンション
+                # 各サンプルに対して、すべての区間ペア（i, j, k）を計算
+                sample_loss = torch.tensor(0.0, device=predictions.device)
+                num_pairs = 0
                 
-                # ランキング損失: ノイズ区間のアテンション < 正常区間の最小アテンション
-                # max(0, noise_attn - normal_min_attn + margin) は、
-                # ノイズ区間のアテンションが正常区間より大きい場合にペナルティを課す
-                ranking_loss += F.relu(noise_attn - normal_min_attn + ranking_margin)
+                for i in range(num_intervals):
+                    for j in range(num_intervals):
+                        for k in range(num_intervals):
+                            if i == j or i == k or j == k:
+                                continue  # 同じ区間のペアはスキップ
+                            
+                            # Y_hat_i, Y_hat_j, Y_hat_k: 区間i, j, kがノイズ区間かどうか
+                            # ノイズ区間なら1、正常区間なら0として扱う
+                            y_hat_i = 1 if i == noise_idx else 0
+                            y_hat_j = 1 if j == noise_idx else 0
+                            y_hat_k = 1 if k == noise_idx else 0
+                            
+                            # Y_dot_ij: iとjが異なるクラスなら+1、同じなら-1
+                            y_dot_ij = 1.0 if y_hat_i != y_hat_j else -1.0
+                            # Y_dot_ik: iとkが異なるクラスなら+1、同じなら-1
+                            y_dot_ik = 1.0 if y_hat_i != y_hat_k else -1.0
+                            
+                            # (1 - Y_dot_ij * Y_dot_ik) が0でない場合のみ考慮
+                            # Y_dot_ij * Y_dot_ik = 1 の場合（両方+1または両方-1）は0になる
+                            # Y_dot_ij * Y_dot_ik = -1 の場合（一方が+1、もう一方が-1）は2になる
+                            weight = 1.0 - y_dot_ij * y_dot_ik
+                            
+                            if weight > 0:  # 異なるクラスのペアのみ考慮
+                                # a_ij: 区間iのアテンション値
+                                # a_ik: 区間kのアテンション値
+                                a_ij = attns[i]
+                                a_ik = attns[k]
+                                
+                                # max(m, Y_dot_ij * a_ij + Y_dot_ik * a_ik) を計算
+                                # ノイズ区間のアテンション < 正常区間のアテンション になるように学習
+                                # Y_dot_ij = +1（iがノイズ、jが正常）の場合、a_ijを小さくしたい
+                                # Y_dot_ik = +1（iがノイズ、kが正常）の場合、a_ikを小さくしたい
+                                term = y_dot_ij * a_ij + y_dot_ik * a_ik
+                                # max(m, term) を計算（数式通り）
+                                # torch.maximum は2つのテンソルの要素ごとの最大値を返す
+                                loss_term = weight * torch.maximum(torch.tensor(ranking_margin, device=term.device), term)
+                                sample_loss += loss_term
+                                num_pairs += 1
+                
+                # サンプルごとの平均を計算
+                if num_pairs > 0:
+                    ranking_loss += sample_loss / num_pairs
             
-            ranking_loss = ranking_loss / B if B > 0 else torch.tensor(0.0, device=predictions.device)  # バッチ平均
+            # バッチ平均
+            ranking_loss = ranking_loss / B if B > 0 else torch.tensor(0.0, device=predictions.device)
             
             if debug and batch_idx == 0:
                 print(f"\n=== ノイズ強度の逆数損失 (バッチ {batch_idx}) ===")
@@ -298,8 +339,10 @@ def compute_loss(
             # 最もアテンションが低い区間をノイズ区間として予測
             predicted_noise_intervals = interval_attention.argmin(dim=1)  # (B,)
             
-            # 復元損失を計算（予測が正しい場合のみ）
-            reconstruction_losses = []
+            # 復元損失を計算（予測が正しい場合のみ計算）
+            # 予測が外れたサンプルでは復元損失を計算しない
+            # → ノイズ区間の予測精度が上がっても、総復元損失が増加しない
+            reconstruction_losses_correct = []  # 予測が正しい場合の復元損失
             reconstruction_accuracies = []  # 復元精度を記録
             data_std = 0.82  # 正規化後の標準偏差（約0.82、eval.pyと同じ値）
             
@@ -307,8 +350,18 @@ def compute_loss(
                 pred_interval = predicted_noise_intervals[i].item()
                 true_interval = noise_intervals[i].item()
                 
-                # 予測が正しい場合のみ復元損失を計算（アプローチ2）
+                # 予測が正しい場合のみ復元損失を計算
                 if pred_interval == true_interval:
+                    # 真のノイズ区間を中心に復元範囲を決定（3区間: 真のノイズ区間±1区間）
+                    window_size = 1
+                    true_start_interval = max(0, true_interval - window_size)
+                    true_end_interval = min(num_intervals - 1, true_interval + window_size)
+                    
+                    # 正解データを取得
+                    true_start_idx = true_start_interval * points_per_interval
+                    true_end_idx = min((true_end_interval + 1) * points_per_interval, L)
+                    true_original = original_data[i, true_start_idx:true_end_idx]  # (reconstructed_length,)
+                    
                     # 復元範囲の情報を取得
                     start_interval = reconstructed_intervals_info[i, 0].item()
                     end_interval = reconstructed_intervals_info[i, 1].item()
@@ -318,19 +371,14 @@ def compute_loss(
                     reconstructed_length = num_intervals_reconstructed * points_per_interval
                     pred_reconstructed = reconstructed_interval[i, :reconstructed_length]  # (reconstructed_length,)
                     
-                    # 正解データも同じ範囲を取得
-                    true_start_idx = start_interval * points_per_interval
-                    true_end_idx = min((end_interval + 1) * points_per_interval, L)
-                    true_original = original_data[i, true_start_idx:true_end_idx]  # (reconstructed_length,)
-                    
                     # 長さが一致することを確認
                     min_length = min(pred_reconstructed.shape[0], true_original.shape[0])
                     pred_reconstructed = pred_reconstructed[:min_length]
-                    true_original = true_original[:min_length]
+                    true_original_aligned = true_original[:min_length]
                     
                     # MSE損失
-                    interval_loss = F.mse_loss(pred_reconstructed, true_original)
-                    reconstruction_losses.append(interval_loss)
+                    interval_loss = F.mse_loss(pred_reconstructed, true_original_aligned)
+                    reconstruction_losses_correct.append(interval_loss)
                     
                     # 復元精度（%）を計算（eval.pyと同じ方法）
                     mse_loss = interval_loss.item()
@@ -339,25 +387,34 @@ def compute_loss(
                     reconstruction_accuracy = max(0.0, (1.0 - relative_rmse) * 100.0)
                     reconstruction_accuracies.append(reconstruction_accuracy)
             
-            if len(reconstruction_losses) > 0:
-                recon_loss = lambda_recon * torch.stack(reconstruction_losses).mean()
+            # 予測が正しい場合のみ復元損失を計算
+            if len(reconstruction_losses_correct) > 0:
+                recon_loss = lambda_recon_correct * torch.stack(reconstruction_losses_correct).mean()
                 recon_accuracy = np.mean(reconstruction_accuracies) if len(reconstruction_accuracies) > 0 else 0.0
             else:
                 recon_loss = torch.tensor(0.0, device=predictions.device)
                 recon_accuracy = 0.0
             
             if debug and batch_idx == 0:
-                print(f"\n復元損失の統計（5区間復元）:")
-                print(f"  予測が正しいサンプル数: {len(reconstruction_losses)} / {B}")
-                if len(reconstruction_losses) > 0:
-                    print(f"  平均復元損失: {torch.stack(reconstruction_losses).mean().item():.6f}")
-                    print(f"  lambda_recon: {lambda_recon}")
-                    print(f"  recon_loss (lambda_recon * avg): {recon_loss.item():.6f}")
-                    if len(reconstruction_losses) > 0:
-                        sample_idx = 0
-                        start_interval = reconstructed_intervals_info[sample_idx, 0].item()
-                        end_interval = reconstructed_intervals_info[sample_idx, 1].item()
-                        print(f"  サンプル0の復元範囲: 区間{start_interval}〜{end_interval}（合計{end_interval-start_interval+1}区間）")
+                print(f"\n復元損失の統計（3区間復元、予測が正しい場合のみ計算）:")
+                print(f"  予測が正しいサンプル数: {len(reconstruction_losses_correct)} / {B}")
+                print(f"  予測が外れたサンプル数: {B - len(reconstruction_losses_correct)} / {B}")
+                if len(reconstruction_losses_correct) > 0:
+                    print(f"  予測が正しい場合の平均復元損失: {torch.stack(reconstruction_losses_correct).mean().item():.6f}")
+                    print(f"  lambda_recon_correct: {lambda_recon_correct}")
+                    print(f"  総復元損失: {recon_loss.item():.6f}")
+                    print(f"  平均復元精度: {recon_accuracy:.2f}%")
+                    sample_idx = 0
+                    if len(reconstruction_losses_correct) > 0:
+                        # 予測が正しいサンプルのインデックスを取得
+                        correct_indices = [i for i in range(B) if predicted_noise_intervals[i].item() == noise_intervals[i].item()]
+                        if len(correct_indices) > 0:
+                            sample_idx = correct_indices[0]
+                            start_interval = reconstructed_intervals_info[sample_idx, 0].item()
+                            end_interval = reconstructed_intervals_info[sample_idx, 1].item()
+                            print(f"  サンプル{sample_idx}の復元範囲: 区間{start_interval}〜{end_interval}（合計{end_interval-start_interval+1}区間）")
+                else:
+                    print(f"  予測が正しいサンプルがないため、復元損失は0.0")
         else:
             # attention_weights is Noneの場合、復元損失は計算しない
             # recon_accuracyは既に0.0で初期化されている
@@ -389,7 +446,8 @@ def train_task4(
     out_dir="task4_output",
     resume=True,
     lambda_reg=1.0,  # 正則化損失の重み（0.1 → 1.0に増加）
-    lambda_recon=10.0,  # 復元損失の重み（復元損失が最も重要なので大きく設定）
+    lambda_recon=50.0,  # 復元損失の重み（予測が外れた場合、30.0 → 50.0に増加）
+    lambda_recon_correct=100.0,  # 予測が正しい場合の復元損失の重み（予測が外れた場合のlambda_reconより大きく設定）
     lambda_mask=20.0,  # マスク予測損失の重み（予測精度を上げるために重要）
     lambda_noise_interval=50.0,  # ノイズ区間予測損失の重み（10.0 → 50.0に増加、ノイズ区間を特定するために重要）
     lambda_ranking=30.0,  # ランキング損失の重み（ノイズ区間のアテンション < 正常区間の最小アテンションを保証）
@@ -468,6 +526,26 @@ def train_task4(
     ).to(device)
     
     print(f"Model created: d_model={d_model}, n_heads={n_heads}, num_layers={num_layers}, dim_feedforward={dim_feedforward}")
+    
+    # バージョン情報を表示
+    print("\n" + "=" * 60)
+    print("【コードバージョン情報】")
+    print("=" * 60)
+    print("✅ 新しいコード（v3.0）が実行されています")
+    print("\n【主な変更点】")
+    print("1. 復元範囲: 5区間 → 3区間（ノイズ区間の左右1つずつ）")
+    print("2. 予測が正しい場合のみ復元損失を計算（予測が外れた場合は計算しない）")
+    print("3. 予測が正しい場合の復元損失の重みを強化（lambda_recon_correct = 100.0）")
+    print("4. ノイズ区間予測損失の重みを大幅に増加（lambda_noise_interval = 500.0）")
+    print("5. ランキング損失の重みを大幅に増加（lambda_ranking = 300.0）")
+    print("\n【設定値】")
+    print(f"  lambda_recon_correct: {lambda_recon_correct} (予測が正しい場合のみ使用)")
+    print(f"  lambda_noise_interval: {lambda_noise_interval} (ノイズ区間予測損失の重み)")
+    print(f"  lambda_ranking: {lambda_ranking} (ランキング損失の重み)")
+    print(f"  復元範囲: 3区間（window_size = 1）")
+    print(f"  復元損失: 予測が正しい場合のみ計算")
+    print("=" * 60)
+    print()
     
     optimizer = Adam(model.parameters(), lr=lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
@@ -588,9 +666,11 @@ def train_task4(
                     print("\n" + "=" * 60)
                     print("【学習パラメータ確認】")
                     print(f"  lambda_reg: {lambda_reg}")
-                    print(f"  lambda_recon: {lambda_recon}")
+                    print(f"  lambda_recon_correct: {lambda_recon_correct} (予測が正しい場合のみ使用)")
                     print(f"  lambda_mask: {lambda_mask}")
                     print(f"  lambda_noise_interval: {lambda_noise_interval}")
+                    print(f"  lambda_ranking: {lambda_ranking}")
+                    print(f"  ranking_margin: {ranking_margin}")
                     print(f"  lr: {lr}")
                     print("=" * 60)
                 else:
@@ -602,9 +682,66 @@ def train_task4(
             with autocast(enabled=(device == "cuda")):
                 # 復元機能を使う場合はreturn_attention=Trueで復元結果も取得
                 if original_data is not None:
+                    # まず予測区間を中心に復元
                     pred, cls_out, attention_weights, reconstructed_interval, reconstructed_intervals_info = model(
                         x, m, return_attention=True, num_intervals=num_intervals
                     )
+                    
+                    # 予測が外れたサンプルでも真のノイズ区間を復元する
+                    # 予測が外れたサンプルのインデックスを取得
+                    if attention_weights is not None:
+                        B = attention_weights.shape[0]
+                        L = x.shape[1]
+                        points_per_interval = L // num_intervals
+                        
+                        # CLSトークンから各区間へのアテンションを取得
+                        cls_attention_full = attention_weights[:, :, 0, 1:]  # (B, n_heads, L)
+                        cls_attention_mean = cls_attention_full.mean(dim=1)  # (B, L)
+                        
+                        # 区間ごとのアテンションを計算
+                        interval_attention_list = []
+                        for i in range(B):
+                            interval_attn = []
+                            for j in range(num_intervals):
+                                start_idx = j * points_per_interval
+                                end_idx = min(start_idx + points_per_interval, L)
+                                attn = cls_attention_mean[i, start_idx:end_idx].mean()
+                                interval_attn.append(attn)
+                            interval_attention_list.append(torch.stack(interval_attn))
+                        
+                        interval_attention = torch.stack(interval_attention_list)  # (B, num_intervals)
+                        predicted_noise_intervals = interval_attention.argmin(dim=1)  # (B,)
+                        
+                        # 予測が外れたサンプルのインデックスを取得
+                        wrong_prediction_mask = predicted_noise_intervals != noise_intervals
+                        
+                        if wrong_prediction_mask.any():
+                            # 予測が外れたサンプルでも真のノイズ区間を復元する
+                            pred_wrong, _, _, reconstructed_interval_wrong, reconstructed_intervals_info_wrong = model(
+                                x, m, return_attention=True, num_intervals=num_intervals, true_noise_intervals=noise_intervals
+                            )
+                            
+                            # 予測が外れたサンプルの復元データを置き換え
+                            # サイズが異なる可能性があるため、元のサイズに合わせてパディングまたは切り詰め
+                            original_max_length = reconstructed_interval.shape[1]
+                            wrong_max_length = reconstructed_interval_wrong.shape[1]
+                            
+                            for i in range(B):
+                                if wrong_prediction_mask[i]:
+                                    wrong_recon = reconstructed_interval_wrong[i]
+                                    
+                                    # サイズが異なる場合の処理
+                                    if wrong_recon.shape[0] < original_max_length:
+                                        # パディング
+                                        padding = torch.zeros(original_max_length - wrong_recon.shape[0], 
+                                                            device=wrong_recon.device, dtype=wrong_recon.dtype)
+                                        wrong_recon = torch.cat([wrong_recon, padding], dim=0)
+                                    elif wrong_recon.shape[0] > original_max_length:
+                                        # 切り詰め
+                                        wrong_recon = wrong_recon[:original_max_length]
+                                    
+                                    reconstructed_interval[i] = wrong_recon
+                                    reconstructed_intervals_info[i] = reconstructed_intervals_info_wrong[i]
                 else:
                     pred, cls_out, attention_weights, _, _ = model(x, m, return_attention=True)
                     reconstructed_interval = None
@@ -621,6 +758,7 @@ def train_task4(
                     original_data=original_data,
                     lambda_reg=lambda_reg,
                     lambda_recon=lambda_recon,  # 復元損失の重み（パラメータから取得）
+                    lambda_recon_correct=lambda_recon_correct,  # 予測が正しい場合の復元損失の重み（パラメータから取得）
                     lambda_mask=lambda_mask,  # マスク予測損失の重み（パラメータから取得）
                     lambda_noise_interval=lambda_noise_interval,  # ノイズ区間予測損失の重み（パラメータから取得）
                     lambda_ranking=lambda_ranking,  # ランキング損失の重み（パラメータから取得）
@@ -735,9 +873,50 @@ def train_task4(
                     
                     with autocast(enabled=(device == "cuda")):
                         if original_data is not None:
+                            # まず予測区間を中心に復元
                             pred, cls_out, attention_weights, reconstructed_interval, reconstructed_intervals_info = model(
                                 x, m, return_attention=True, num_intervals=num_intervals
                             )
+                            
+                            # 予測が外れたサンプルでも真のノイズ区間を復元する
+                            # 予測が外れたサンプルのインデックスを取得
+                            if attention_weights is not None:
+                                B = attention_weights.shape[0]
+                                L = x.shape[1]
+                                points_per_interval = L // num_intervals
+                                
+                                # CLSトークンから各区間へのアテンションを取得
+                                cls_attention_full = attention_weights[:, :, 0, 1:]  # (B, n_heads, L)
+                                cls_attention_mean = cls_attention_full.mean(dim=1)  # (B, L)
+                                
+                                # 区間ごとのアテンションを計算
+                                interval_attention_list = []
+                                for i in range(B):
+                                    interval_attn = []
+                                    for j in range(num_intervals):
+                                        start_idx = j * points_per_interval
+                                        end_idx = min(start_idx + points_per_interval, L)
+                                        attn = cls_attention_mean[i, start_idx:end_idx].mean()
+                                        interval_attn.append(attn)
+                                    interval_attention_list.append(torch.stack(interval_attn))
+                                
+                                interval_attention = torch.stack(interval_attention_list)  # (B, num_intervals)
+                                predicted_noise_intervals = interval_attention.argmin(dim=1)  # (B,)
+                                
+                                # 予測が外れたサンプルのインデックスを取得
+                                wrong_prediction_mask = predicted_noise_intervals != noise_intervals
+                                
+                                if wrong_prediction_mask.any():
+                                    # 予測が外れたサンプルでも真のノイズ区間を復元する
+                                    pred_wrong, _, _, reconstructed_interval_wrong, reconstructed_intervals_info_wrong = model(
+                                        x, m, return_attention=True, num_intervals=num_intervals, true_noise_intervals=noise_intervals
+                                    )
+                                    
+                                    # 予測が外れたサンプルの復元データを置き換え
+                                    for i in range(B):
+                                        if wrong_prediction_mask[i]:
+                                            reconstructed_interval[i] = reconstructed_interval_wrong[i]
+                                            reconstructed_intervals_info[i] = reconstructed_intervals_info_wrong[i]
                         else:
                             pred, cls_out, attention_weights, _, _ = model(x, m, return_attention=True)
                             reconstructed_interval = None

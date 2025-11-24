@@ -84,19 +84,20 @@ class Task4BERT(nn.Module):
         # アテンションフック用のハンドル
         self.hooks = []
     
-    def forward(self, x, mask_positions, return_attention=False, num_intervals=30):
+    def forward(self, x, mask_positions, return_attention=False, num_intervals=30, true_noise_intervals=None):
         """
         Args:
             x: (B, L) マスクされたPSDデータ
             mask_positions: (B, L) マスク位置 [True/False]
             return_attention: アテンションウェイトを返すかどうか
             num_intervals: 区間数（デフォルト: 30）
+            true_noise_intervals: (B,) 真のノイズ区間（予測が外れた場合の復元用、Noneの場合は予測区間を使用）
         
         Returns:
             out: (B, L) 予測されたPSDデータ（マスク予測タスク用）
             cls_out: (B, d_model) CLSトークンの表現
             attention_weights: (B, n_heads, L+1, L+1) アテンションウェイト（return_attention=Trueの場合）
-            reconstructed_interval: (B, max_length) 復元された区間（予測区間±2区間、最大500ポイント、return_attention=Trueの場合のみ）
+            reconstructed_interval: (B, max_length) 復元された区間（予測区間±1区間、最大300ポイント、return_attention=Trueの場合のみ）
             reconstructed_intervals_info: (B, 3) 復元範囲の情報 [start_interval, end_interval, predicted_interval]（return_attention=Trueの場合のみ）
         """
         B, L = x.shape
@@ -171,20 +172,25 @@ class Task4BERT(nn.Module):
             # 最もアテンションが低い区間をノイズ区間として検知
             predicted_noise_intervals = cls_attention.argmin(dim=1)  # (B,) - 予測されたノイズ区間
             
-            # 予測した区間を中心に左右2区間ずつ（合計5区間）を復元
+            # 予測した区間を中心に左右1区間ずつ（合計3区間）を復元
+            # true_noise_intervalsが指定されている場合は、予測が外れたサンプルでも真のノイズ区間を復元
             points_per_interval = self.seq_len // num_intervals
-            window_size = 2  # 左右に2区間ずつ
+            window_size = 1  # 左右に1区間ずつ
             reconstructed_intervals_list = []
             
             for i in range(B):
-                predicted_interval = predicted_noise_intervals[i].item()
+                # 真のノイズ区間が指定されている場合はそれを使用、そうでなければ予測区間を使用
+                if true_noise_intervals is not None:
+                    interval_to_reconstruct = true_noise_intervals[i].item()
+                else:
+                    interval_to_reconstruct = predicted_noise_intervals[i].item()
                 
-                # 復元する区間の範囲を決定（予測区間±2区間）
-                start_interval = max(0, predicted_interval - window_size)
-                end_interval = min(num_intervals - 1, predicted_interval + window_size)
+                # 復元する区間の範囲を決定（区間±1区間）
+                start_interval = max(0, interval_to_reconstruct - window_size)
+                end_interval = min(num_intervals - 1, interval_to_reconstruct + window_size)
                 num_intervals_to_reconstruct = end_interval - start_interval + 1
                 
-                # 5区間分の特徴を取得して復元
+                # 3区間分の特徴を取得して復元
                 reconstructed_parts = []
                 for interval_idx in range(start_interval, end_interval + 1):
                     # 各区間の開始・終了インデックス
@@ -200,7 +206,7 @@ class Task4BERT(nn.Module):
                     reconstructed_interval_single = self.reconstruction_head(interval_feature.unsqueeze(0))  # (1, 100)
                     reconstructed_parts.append(reconstructed_interval_single.squeeze(0))  # (100,)
                 
-                # 5区間分を結合（合計500ポイント）
+                # 3区間分を結合（合計300ポイント）
                 reconstructed_combined = torch.cat(reconstructed_parts, dim=0)  # (num_intervals_to_reconstruct * 100,)
                 reconstructed_intervals_list.append(reconstructed_combined)
             
@@ -211,8 +217,14 @@ class Task4BERT(nn.Module):
             
             for i, r in enumerate(reconstructed_intervals_list):
                 predicted_interval = predicted_noise_intervals[i].item()
-                start_interval = max(0, predicted_interval - window_size)
-                end_interval = min(num_intervals - 1, predicted_interval + window_size)
+                # 真のノイズ区間が指定されている場合はそれを使用、そうでなければ予測区間を使用
+                if true_noise_intervals is not None:
+                    interval_to_reconstruct = true_noise_intervals[i].item()
+                else:
+                    interval_to_reconstruct = predicted_interval
+                
+                start_interval = max(0, interval_to_reconstruct - window_size)
+                end_interval = min(num_intervals - 1, interval_to_reconstruct + window_size)
                 
                 if r.shape[0] < max_length:
                     # パディング（最後に0を追加）
