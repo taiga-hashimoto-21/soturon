@@ -41,6 +41,8 @@ def compute_loss(
     lambda_recon=1.0,
     lambda_mask=1.0,  # マスク予測損失の重み（予測精度を上げるために重要）
     lambda_noise_interval=10.0,  # ノイズ区間予測損失の重み（ノイズ区間を特定するために重要）
+    lambda_ranking=10.0,  # ランキング損失の重み（ノイズ区間のアテンション < 正常区間の最小アテンションを保証）
+    ranking_margin=0.01,  # ランキング損失のマージン（余裕を持たせる）
     num_intervals=30,
     points_per_interval=100,
     margin=0.1,
@@ -83,6 +85,7 @@ def compute_loss(
     # 2. 正則化損失: アテンションウェイトがノイズ強度の逆数になるように学習
     reg_loss = torch.tensor(0.0, device=predictions.device)
     noise_interval_prediction_loss = None  # ノイズ区間予測損失（初期化）
+    ranking_loss = None  # ランキング損失（初期化）
     recon_accuracy = 0.0  # 復元精度（初期化）
     
     if attention_weights is not None:
@@ -163,17 +166,35 @@ def compute_loss(
             # 1. 実際のノイズ区間を正解として使用（最重要の改善）
             target_noise_interval = noise_intervals  # (B,) 実際のノイズ区間を直接使用
             
-            # 2. ノイズ区間のアテンションを取得
-            noise_interval_attention = interval_attention_normalized[range(B), target_noise_interval]  # (B,)
+            # 2. ノイズ区間のアテンションを取得（正規化前の値を使用 - 予測と一貫性を保つため）
+            noise_interval_attention = interval_attention[range(B), target_noise_interval]  # (B,) - 正規化前
             
             # 3. 目標アテンションは0（ノイズ区間のアテンションを最小化）
             target_noise_interval_attention = torch.zeros_like(noise_interval_attention)  # (B,)
             
-            # 4. MSE損失で学習（クロスエントロピー損失の代わりにMSE損失を使用）
+            # 4. MSE損失で学習（正規化前の値で計算）
             noise_interval_prediction_loss = F.mse_loss(
                 noise_interval_attention,
                 target_noise_interval_attention
             )
+            
+            # 5. ランキング損失: ノイズ区間のアテンション < 正常区間の最小アテンション になるように学習
+            ranking_loss = torch.tensor(0.0, device=predictions.device)
+            for i in range(B):
+                noise_idx = noise_intervals[i].item()
+                noise_attn = interval_attention[i, noise_idx]  # 正規化前
+                
+                # 正常区間のインデックスを取得
+                normal_indices = [j for j in range(num_intervals) if j != noise_idx]
+                normal_attns = interval_attention[i, normal_indices]  # 正常区間のアテンション
+                normal_min_attn = normal_attns.min()  # 正常区間の最小アテンション
+                
+                # ランキング損失: ノイズ区間のアテンション < 正常区間の最小アテンション
+                # max(0, noise_attn - normal_min_attn + margin) は、
+                # ノイズ区間のアテンションが正常区間より大きい場合にペナルティを課す
+                ranking_loss += F.relu(noise_attn - normal_min_attn + ranking_margin)
+            
+            ranking_loss = ranking_loss / B if B > 0 else torch.tensor(0.0, device=predictions.device)  # バッチ平均
             
             if debug and batch_idx == 0:
                 print(f"\n=== ノイズ強度の逆数損失 (バッチ {batch_idx}) ===")
@@ -194,12 +215,18 @@ def compute_loss(
                 print(f"\n=== ノイズ区間予測損失 (バッチ {batch_idx}) ===")
                 print(f"  実際のノイズ区間（noise_intervals）: {noise_intervals[0].item()}")
                 print(f"  目標ノイズ区間（target_noise_interval = noise_intervals）: {target_noise_interval[0].item()}")
-                print(f"  予測ノイズ区間（interval_attention_normalized.argmin）: {interval_attention_normalized.argmin(dim=1)[0].item()}")
-                print(f"  ノイズ区間の予測アテンション: {noise_interval_attention[0].item():.6f}")
+                print(f"  予測ノイズ区間（interval_attention.argmin、正規化前）: {interval_attention.argmin(dim=1)[0].item()}")
+                print(f"  予測ノイズ区間（interval_attention_normalized.argmin、正規化後）: {interval_attention_normalized.argmin(dim=1)[0].item()}")
+                print(f"  ノイズ区間の予測アテンション（正規化前）: {noise_interval_attention[0].item():.6f}")
                 print(f"  ノイズ区間の目標アテンション: {target_noise_interval_attention[0].item():.6f}")
-                print(f"  ノイズ区間予測損失（MSE）: {noise_interval_prediction_loss.item():.6f}")
+                print(f"  ノイズ区間予測損失（MSE、正規化前）: {noise_interval_prediction_loss.item():.6f}")
                 print(f"  lambda_noise_interval: {lambda_noise_interval}")
                 print(f"  ノイズ区間予測損失（重み付き後）: {(lambda_noise_interval * noise_interval_prediction_loss).item():.6f}")
+                print(f"\n=== ランキング損失 (バッチ {batch_idx}) ===")
+                print(f"  ランキング損失: {ranking_loss.item():.6f}")
+                print(f"  lambda_ranking: {lambda_ranking}")
+                print(f"  ranking_margin: {ranking_margin}")
+                print(f"  ランキング損失（重み付き後）: {(lambda_ranking * ranking_loss).item():.6f}")
                 print("=" * 60)
         else:
             # フォールバック: ノイズ強度が提供されない場合は旧実装を使用（後方互換性）
@@ -238,6 +265,7 @@ def compute_loss(
                 noise_interval_attention_fallback,
                 target_noise_interval_attention_fallback
             )
+            ranking_loss = None  # ランキング損失は計算しない（フォールバックケース）
     
     # 3. 復元損失（ノイズ検知が正しい場合のみ計算 - アプローチ2）
     # 予測区間を中心に左右2区間ずつ（合計5区間）を復元
@@ -345,8 +373,10 @@ def compute_loss(
         total_loss = total_loss + recon_loss
     if noise_interval_prediction_loss is not None:
         total_loss = total_loss + lambda_noise_interval * noise_interval_prediction_loss
+    if ranking_loss is not None:
+        total_loss = total_loss + lambda_ranking * ranking_loss
     
-    return total_loss, mask_loss, reg_loss, recon_loss, recon_accuracy
+    return total_loss, mask_loss, reg_loss, recon_loss, recon_accuracy, ranking_loss
 
 
 def train_task4(
@@ -358,10 +388,12 @@ def train_task4(
     device="cuda" if torch.cuda.is_available() else "cpu",
     out_dir="task4_output",
     resume=True,
-    lambda_reg=0.1,
+    lambda_reg=1.0,  # 正則化損失の重み（0.1 → 1.0に増加）
     lambda_recon=10.0,  # 復元損失の重み（復元損失が最も重要なので大きく設定）
     lambda_mask=20.0,  # マスク予測損失の重み（予測精度を上げるために重要）
-    lambda_noise_interval=10.0,  # ノイズ区間予測損失の重み（ノイズ区間を特定するために重要、30.0 → 10.0に調整）
+    lambda_noise_interval=50.0,  # ノイズ区間予測損失の重み（10.0 → 50.0に増加、ノイズ区間を特定するために重要）
+    lambda_ranking=30.0,  # ランキング損失の重み（ノイズ区間のアテンション < 正常区間の最小アテンションを保証）
+    ranking_margin=0.01,  # ランキング損失のマージン（余裕を持たせる）
     d_model=128,  # 埋め込み次元（64 → 128に増加）
     n_heads=4,  # アテンションヘッド数（2 → 4に増加）
     num_layers=3,  # Transformerレイヤー数（2 → 3に増加）
@@ -581,7 +613,7 @@ def train_task4(
                 # 最初のバッチのみデバッグ情報を出力
                 debug_flag = (epoch == start_epoch and batch_idx == 0)
                 
-                total_loss, mask_loss, reg_loss, recon_loss, recon_accuracy = compute_loss(
+                total_loss, mask_loss, reg_loss, recon_loss, recon_accuracy, ranking_loss = compute_loss(
                     pred, y, m, attention_weights, noise_intervals,
                     noise_strength=noise_strength,  # 各區間のノイズ強度
                     reconstructed_interval=reconstructed_interval,
@@ -591,6 +623,8 @@ def train_task4(
                     lambda_recon=lambda_recon,  # 復元損失の重み（パラメータから取得）
                     lambda_mask=lambda_mask,  # マスク予測損失の重み（パラメータから取得）
                     lambda_noise_interval=lambda_noise_interval,  # ノイズ区間予測損失の重み（パラメータから取得）
+                    lambda_ranking=lambda_ranking,  # ランキング損失の重み（パラメータから取得）
+                    ranking_margin=ranking_margin,  # ランキング損失のマージン（パラメータから取得）
                     num_intervals=num_intervals,
                     points_per_interval=seq_len // num_intervals,
                     margin=margin,
@@ -639,16 +673,16 @@ def train_task4(
                     interval_attention = torch.stack(interval_attention_list)  # (B, num_intervals)
                     interval_attention_normalized = F.normalize(interval_attention, p=1, dim=1)  # (B, num_intervals)
                     
-                    # 予測ノイズ区間
-                    predicted_noise_intervals = interval_attention_normalized.argmin(dim=1)  # (B,)
+                    # 予測ノイズ区間（正規化前の値で予測）
+                    predicted_noise_intervals = interval_attention.argmin(dim=1)  # (B,) - 正規化前の値を使用
                     
                     # 予測精度を計算
                     correct_predictions = (predicted_noise_intervals == noise_intervals).sum().item()
                     running_noise_interval_correct += correct_predictions
                     num_noise_interval_samples += B
                     
-                    # ノイズ区間予測損失を計算（MSE損失）
-                    noise_interval_attention = interval_attention_normalized[range(B), noise_intervals]  # (B,)
+                    # ノイズ区間予測損失を計算（MSE損失、正規化前の値で計算）
+                    noise_interval_attention = interval_attention[range(B), noise_intervals]  # (B,) - 正規化前
                     target_noise_interval_attention = torch.zeros_like(noise_interval_attention)  # (B,)
                     noise_interval_prediction_loss = F.mse_loss(
                         noise_interval_attention,
@@ -709,7 +743,7 @@ def train_task4(
                             reconstructed_interval = None
                             reconstructed_intervals_info = None
                         
-                        total_loss, _, _, recon_loss, recon_accuracy = compute_loss(
+                        total_loss, _, _, recon_loss, recon_accuracy, ranking_loss = compute_loss(
                             pred, y, m, attention_weights, noise_intervals,
                             noise_strength=noise_strength,  # 各區間のノイズ強度
                             reconstructed_interval=reconstructed_interval,
@@ -719,6 +753,8 @@ def train_task4(
                             lambda_recon=lambda_recon,  # 復元損失の重み（パラメータから取得）
                             lambda_mask=lambda_mask,  # マスク予測損失の重み（パラメータから取得）
                             lambda_noise_interval=lambda_noise_interval,  # ノイズ区間予測損失の重み（パラメータから取得）
+                            lambda_ranking=lambda_ranking,  # ランキング損失の重み（パラメータから取得）
+                            ranking_margin=ranking_margin,  # ランキング損失のマージン（パラメータから取得）
                             num_intervals=num_intervals,
                             points_per_interval=seq_len // num_intervals,
                             margin=margin
@@ -755,16 +791,16 @@ def train_task4(
                         interval_attention = torch.stack(interval_attention_list)  # (B, num_intervals)
                         interval_attention_normalized = F.normalize(interval_attention, p=1, dim=1)  # (B, num_intervals)
                         
-                        # 予測ノイズ区間
-                        predicted_noise_intervals = interval_attention_normalized.argmin(dim=1)  # (B,)
+                        # 予測ノイズ区間（正規化前の値で予測）
+                        predicted_noise_intervals = interval_attention.argmin(dim=1)  # (B,) - 正規化前の値を使用
                         
                         # 予測精度を計算
                         correct_predictions = (predicted_noise_intervals == noise_intervals).sum().item()
                         running_val_noise_interval_correct += correct_predictions
                         num_val_noise_interval_samples += B
                         
-                        # ノイズ区間予測損失を計算（MSE損失）
-                        noise_interval_attention = interval_attention_normalized[range(B), noise_intervals]  # (B,)
+                        # ノイズ区間予測損失を計算（MSE損失、正規化前の値で計算）
+                        noise_interval_attention = interval_attention[range(B), noise_intervals]  # (B,) - 正規化前
                         target_noise_interval_attention = torch.zeros_like(noise_interval_attention)  # (B,)
                         noise_interval_prediction_loss = F.mse_loss(
                             noise_interval_attention,
@@ -794,16 +830,18 @@ def train_task4(
         scheduler.step()
         
         # ログ出力
-        # マスク予測損失、ノイズ区間予測精度、復元損失を表示
+        # マスク予測損失、ノイズ区間予測精度、復元損失、復元精度を表示
         mask_pred_str = f"{train_mask_loss:.6f}"
         noise_interval_pred_str = f"{train_noise_interval_accuracy:.4f}" if train_noise_interval_accuracy > 0 else "0.0000"
         recon_loss_str = f"{train_recon_loss:.6f}" if train_recon_loss > 0 else "0.000000"
+        recon_accuracy_str = f"{train_recon_accuracy:.2f}%" if train_recon_accuracy > 0 else "0.00%"
         
         print(
             f"エポック {epoch+1}/{num_epochs} "
             f"マスク予測:{mask_pred_str},"
             f"ノイズ区間予測:{noise_interval_pred_str},"
-            f"復元損失:{recon_loss_str}"
+            f"復元損失:{recon_loss_str},"
+            f"復元精度:{recon_accuracy_str}"
         )
         
         # best model 保存
@@ -827,10 +865,12 @@ def train_task4(
                 "train_mask_losses": train_mask_losses,
                 "train_reg_losses": train_reg_losses,
                 "train_recon_losses": train_recon_losses,
+                "train_recon_accuracies": train_recon_accuracies,  # 復元精度を追加
                 "train_noise_interval_losses": train_noise_interval_losses,
                 "train_noise_interval_accuracies": train_noise_interval_accuracies,
                 "val_losses": val_losses,
                 "val_recon_losses": val_recon_losses,
+                "val_recon_accuracies": val_recon_accuracies,  # 復元精度を追加
                 "val_noise_interval_losses": val_noise_interval_losses,
                 "val_noise_interval_accuracies": val_noise_interval_accuracies,
                 "best_val_loss": best_val_loss,
@@ -851,9 +891,12 @@ def train_task4(
     model.eval()
     attention_data = {
         "predicted_attention": [],  # 予測アテンション（interval_attention_normalized）
+        "predicted_attention_before_normalization": [],  # 予測アテンション（正規化前）
         "target_attention": [],  # 目標アテンション（target_attention_normalized）
+        "target_attention_before_normalization": [],  # 目標アテンション（正規化前）
         "true_noise_intervals": [],  # 実際のノイズ区間（noise_intervals）
         "predicted_noise_intervals": [],  # 予測ノイズ区間（interval_attention_normalized.argmin）
+        "predicted_noise_intervals_before_normalization": [],  # 予測ノイズ区間（正規化前のargmin）
         "noise_strength": [],  # ノイズ強度（noise_strength）
     }
     
@@ -899,25 +942,33 @@ def train_task4(
                             interval_attn.append(attn)
                         interval_attention_list.append(torch.stack(interval_attn))
                     
-                    interval_attention = torch.stack(interval_attention_list)  # (B, num_intervals)
+                    interval_attention = torch.stack(interval_attention_list)  # (B, num_intervals) - 正規化前
                     
                     # ノイズ強度の逆数を使った目標アテンションを計算
                     epsilon = 1e-6
                     noise_strength_safe = noise_strength + epsilon
-                    target_attention = 1.0 / noise_strength_safe  # (B, num_intervals)
+                    target_attention = 1.0 / noise_strength_safe  # (B, num_intervals) - 正規化前
                     
                     # 正規化
                     interval_attention_normalized = F.normalize(interval_attention, p=1, dim=1)  # (B, num_intervals)
                     target_attention_normalized = F.normalize(target_attention, p=1, dim=1)  # (B, num_intervals)
                     
-                    # 予測ノイズ区間
-                    predicted_noise_intervals = interval_attention_normalized.argmin(dim=1)  # (B,)
+                    # 予測ノイズ区間（正規化前の値で予測 - 修正1）
+                    predicted_noise_intervals = interval_attention.argmin(dim=1)  # (B,) - 正規化前の値を使用
                     
-                    # CPUに移動して保存
+                    # 予測ノイズ区間（正規化後 - 比較用に保存）
+                    predicted_noise_intervals_after_norm = interval_attention_normalized.argmin(dim=1)  # (B,)
+                    
+                    # CPUに移動して保存（正規化後と正規化前の両方を保存）
                     attention_data["predicted_attention"].append(interval_attention_normalized.cpu().numpy())
+                    attention_data["predicted_attention_before_normalization"].append(interval_attention.cpu().numpy())
                     attention_data["target_attention"].append(target_attention_normalized.cpu().numpy())
+                    attention_data["target_attention_before_normalization"].append(target_attention.cpu().numpy())
                     attention_data["true_noise_intervals"].append(noise_intervals.cpu().numpy())
                     attention_data["predicted_noise_intervals"].append(predicted_noise_intervals.cpu().numpy())
+                    attention_data["predicted_noise_intervals_before_normalization"].append(predicted_noise_intervals.cpu().numpy())  # 正規化前で予測
+                    attention_data["predicted_noise_intervals_after_normalization"] = attention_data.get("predicted_noise_intervals_after_normalization", [])
+                    attention_data["predicted_noise_intervals_after_normalization"].append(predicted_noise_intervals_after_norm.cpu().numpy())  # 正規化後（比較用）
                     attention_data["noise_strength"].append(noise_strength.cpu().numpy())
                     
                     num_samples_saved += B
@@ -925,9 +976,14 @@ def train_task4(
     # リストをnumpy配列に変換
     if len(attention_data["predicted_attention"]) > 0:
         attention_data["predicted_attention"] = np.concatenate(attention_data["predicted_attention"], axis=0)
+        attention_data["predicted_attention_before_normalization"] = np.concatenate(attention_data["predicted_attention_before_normalization"], axis=0)
         attention_data["target_attention"] = np.concatenate(attention_data["target_attention"], axis=0)
+        attention_data["target_attention_before_normalization"] = np.concatenate(attention_data["target_attention_before_normalization"], axis=0)
         attention_data["true_noise_intervals"] = np.concatenate(attention_data["true_noise_intervals"], axis=0)
         attention_data["predicted_noise_intervals"] = np.concatenate(attention_data["predicted_noise_intervals"], axis=0)
+        attention_data["predicted_noise_intervals_before_normalization"] = np.concatenate(attention_data["predicted_noise_intervals_before_normalization"], axis=0)
+        if "predicted_noise_intervals_after_normalization" in attention_data and len(attention_data["predicted_noise_intervals_after_normalization"]) > 0:
+            attention_data["predicted_noise_intervals_after_normalization"] = np.concatenate(attention_data["predicted_noise_intervals_after_normalization"], axis=0)
         attention_data["noise_strength"] = np.concatenate(attention_data["noise_strength"], axis=0)
         
         # pickleで保存
@@ -941,9 +997,9 @@ def train_task4(
         print("⚠️ アテンション情報を保存できませんでした（データがありません）")
     
     # Lossカーブ描画
-    plt.figure(figsize=(12, 4))
+    plt.figure(figsize=(15, 5))
     
-    plt.subplot(1, 3, 1)
+    plt.subplot(1, 4, 1)
     epochs = range(1, len(train_losses) + 1)
     plt.plot(epochs, train_losses, label="Train Loss")
     if len(val_losses) > 0:
@@ -954,7 +1010,7 @@ def train_task4(
     plt.legend()
     plt.grid(True, alpha=0.3)
     
-    plt.subplot(1, 3, 2)
+    plt.subplot(1, 4, 2)
     plt.plot(epochs, train_mask_losses, label="Mask Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
@@ -962,11 +1018,23 @@ def train_task4(
     plt.legend()
     plt.grid(True, alpha=0.3)
     
-    plt.subplot(1, 3, 3)
+    plt.subplot(1, 4, 3)
     plt.plot(epochs, train_reg_losses, label="Regularization Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.title("Regularization Loss")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # 復元精度のグラフを追加
+    plt.subplot(1, 4, 4)
+    if len(train_recon_accuracies) > 0:
+        plt.plot(epochs, train_recon_accuracies, label="Train Recon Accuracy", color="blue")
+    if len(val_recon_accuracies) > 0:
+        plt.plot(epochs, val_recon_accuracies, label="Val Recon Accuracy", color="red")
+    plt.xlabel("Epoch")
+    plt.ylabel("Reconstruction Accuracy (%)")
+    plt.title("Reconstruction Accuracy")
     plt.legend()
     plt.grid(True, alpha=0.3)
     
@@ -975,6 +1043,26 @@ def train_task4(
     plt.savefig(loss_curve_path)
     plt.close()
     print(f"Loss curve saved to {loss_curve_path}")
+    
+    # 復元精度のグラフを別途保存（より詳細な表示）
+    if len(train_recon_accuracies) > 0 or len(val_recon_accuracies) > 0:
+        plt.figure(figsize=(10, 6))
+        if len(train_recon_accuracies) > 0:
+            plt.plot(epochs, train_recon_accuracies, label="Train Reconstruction Accuracy", color="blue", linewidth=2)
+            print(f"Train復元精度: {train_recon_accuracies[0]:.2f}% → {train_recon_accuracies[-1]:.2f}%")
+        if len(val_recon_accuracies) > 0:
+            plt.plot(epochs, val_recon_accuracies, label="Val Reconstruction Accuracy", color="red", linewidth=2)
+            print(f"Val復元精度: {val_recon_accuracies[0]:.2f}% → {val_recon_accuracies[-1]:.2f}%")
+        plt.xlabel("Epoch", fontsize=12)
+        plt.ylabel("Reconstruction Accuracy (%)", fontsize=12)
+        plt.title("Reconstruction Accuracy", fontsize=14, fontweight="bold")
+        plt.legend(fontsize=11)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        recon_accuracy_curve_path = os.path.join(out_dir, "reconstruction_accuracy_curve.png")
+        plt.savefig(recon_accuracy_curve_path, dpi=150)
+        plt.close()
+        print(f"Reconstruction accuracy curve saved to {recon_accuracy_curve_path}")
     
     # ノイズ区間予測の精度と損失のグラフを描画
     if len(train_noise_interval_losses) > 0:

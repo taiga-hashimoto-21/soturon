@@ -90,6 +90,13 @@ def compute_noise_detection_reconstruction_loss(
             mse_loss = F.mse_loss(pred_reconstructed, true_original)
             reconstruction_losses.append(mse_loss)
             
+            # 復元精度（%）を計算（eval.pyと同じ方法）
+            import numpy as np
+            data_std = 0.82  # 正規化後の標準偏差（約0.82）
+            rmse = np.sqrt(mse_loss.item())
+            relative_rmse = rmse / data_std
+            reconstruction_accuracy = max(0.0, (1.0 - relative_rmse) * 100.0)
+            
             # (b) 相対誤差（大きな値と小さな値の両方で精度を評価）
             relative_error = torch.abs(pred_reconstructed - true_original) / (
                 torch.abs(true_original) + 1e-8
@@ -138,12 +145,20 @@ def compute_noise_detection_reconstruction_loss(
             0.3 * reconstruction_loss_relative +
             0.1 * reconstruction_loss_smoothness
         )
+        
+        # 復元精度を計算（MSE損失から、eval.pyと同じ方法）
+        import numpy as np
+        data_std = 0.82  # 正規化後の標準偏差（約0.82）
+        rmse = np.sqrt(reconstruction_loss_mse.item())
+        relative_rmse = rmse / data_std
+        reconstruction_accuracy = max(0.0, (1.0 - relative_rmse) * 100.0)
     else:
         # マスク予測が全て間違っている場合、復元損失は0（マスク予測損失のみで学習）
         reconstruction_loss = torch.tensor(0.0, device=predicted_mask.device)
         reconstruction_loss_mse = torch.tensor(0.0, device=predicted_mask.device)
         reconstruction_loss_relative = torch.tensor(0.0, device=predicted_mask.device)
         reconstruction_loss_smoothness = torch.tensor(0.0, device=predicted_mask.device)
+        reconstruction_accuracy = 0.0
     
     # 3. 総損失
     total_loss = (
@@ -161,6 +176,7 @@ def compute_noise_detection_reconstruction_loss(
         'reconstruction_loss_smoothness': reconstruction_loss_smoothness.item(),
         'num_correct_masks': num_correct_masks,
         'mask_accuracy': num_correct_masks / batch_size,  # マスク予測の精度
+        'reconstruction_accuracy': reconstruction_accuracy if num_correct_masks > 0 else 0.0,  # 復元精度を追加
         'mask_loss_weight': mask_loss_weight,
         'reconstruction_loss_weight': reconstruction_loss_weight,
     }

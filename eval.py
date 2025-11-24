@@ -110,6 +110,19 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
     Returns:
         dict: 評価指標の辞書
     """
+    # ============================================================
+    # 【コードバージョン確認】
+    # ============================================================
+    print("=" * 60)
+    print("【評価コードのバージョン確認】")
+    print("=" * 60)
+    print("✅ 新しいコード（修正版）が実行されています")
+    print("   予測方法: 正規化前のアテンションウェイトを使用")
+    print("   学習時と同じ方法で予測します")
+    print("   予測コード: final_predictions = np.array([np.argmin(all_attention[i]) ...])")
+    print("=" * 60)
+    print()
+    
     model.eval()
     all_attention_weights = []
     all_labels = []
@@ -140,29 +153,28 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
             
             if attention_weights is not None:
                 # CLSトークンから各区間へのアテンションを取得
-                if hasattr(model, 'get_cls_attention_to_intervals'):
-                    cls_attention = model.get_cls_attention_to_intervals(
-                        attention_weights, num_intervals=num_intervals
-                    )
-                else:
-                    # フォールバック: 手動で計算
-                    B = attention_weights.shape[0]
-                    L = x.shape[1]
-                    points_per_interval = L // num_intervals
-                    
-                    # CLSトークンはインデックス0
-                    cls_attention_full = attention_weights[:, :, 0, 1:]  # (B, n_heads, L)
-                    cls_attention_mean = cls_attention_full.mean(dim=1)  # (B, L)
-                    
-                    # 区間ごとに平均化
-                    cls_attention_intervals = []
-                    for i in range(num_intervals):
-                        start_idx = i * points_per_interval
+                # 重要: 学習時と同じ方法で計算するため、手動で計算する（train.py 280-296行目と同じ方法）
+                # model.get_cls_attention_to_intervals()はmodel.seq_lenを使うため、学習時と異なる可能性がある
+                B = attention_weights.shape[0]
+                L = x.shape[1]  # 学習時と同じく、x.shape[1]を使用
+                points_per_interval = L // num_intervals
+                
+                # CLSトークンはインデックス0
+                cls_attention_full = attention_weights[:, :, 0, 1:]  # (B, n_heads, L)
+                cls_attention_mean = cls_attention_full.mean(dim=1)  # (B, L)
+                
+                # 区間ごとのアテンションを計算（学習時と同じ方法: train.py 286-296行目）
+                interval_attention_list = []
+                for i in range(B):
+                    interval_attn = []
+                    for j in range(num_intervals):
+                        start_idx = j * points_per_interval
                         end_idx = min(start_idx + points_per_interval, L)
-                        interval_attn = cls_attention_mean[:, start_idx:end_idx].mean(dim=1)
-                        cls_attention_intervals.append(interval_attn)
-                    
-                    cls_attention = torch.stack(cls_attention_intervals, dim=1)  # (B, num_intervals)
+                        attn = cls_attention_mean[i, start_idx:end_idx].mean()
+                        interval_attn.append(attn)
+                    interval_attention_list.append(torch.stack(interval_attn))
+                
+                cls_attention = torch.stack(interval_attention_list)  # (B, num_intervals)
                 
                 # 学習時と同じ処理を適用（train.pyと一致させる）
                 # 重要: 学習時はスケーリングしていない（train.py 117-129行目を参照）
@@ -220,14 +232,27 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
     print(f"  正常区間の平均: {normal_attention.mean():.6f} (最小: {normal_attention.min():.6f}, 最大: {normal_attention.max():.6f})")
     print(f"  差（正常 - ノイズ）: {attention_diff:.6f}")
     
-    # 予測方法: 常に「最もアテンションが低い区間」を予測（argmin()を使用）
-    # 設計意図: ノイズ区間のアテンション < 正常区間のアテンション
-    # → アテンションが低い区間をノイズと判定
-    # 学習時と同じ方法を使用（interval_attention_normalized.argmin()）
-    # 閾値は使用しない（常にargmin()で予測）
-    # 重要: 正規化後のアテンションウェイトを使用する
-    print("予測を実行中（最もアテンションが低い区間を予測、argmin()を使用、正規化後）...")
-    final_predictions = np.array([np.argmin(all_attention_normalized[i]) for i in range(len(all_labels))])
+    # 予測方法: 学習時と同じく、正規化前のアテンションウェイトを使用して予測
+    # 学習時（train.py 299行目）: predicted_noise_intervals = interval_attention.argmin(dim=1)
+    # → 正規化前のアテンションウェイトを使用
+    # 重要: 学習時と同じ方法を使用するため、正規化前のアテンションウェイトで予測する
+    print("=" * 60)
+    print("【予測方法の確認】")
+    print("=" * 60)
+    print("✅ 正規化前のアテンションウェイトを使用して予測します")
+    print("   学習時と同じ方法: interval_attention.argmin(dim=1)")
+    print("   予測コード: final_predictions = np.array([np.argmin(all_attention[i]) ...])")
+    print("=" * 60)
+    print()
+    print("予測を実行中（最もアテンションが低い区間を予測、argmin()を使用、正規化前）...")
+    final_predictions = np.array([np.argmin(all_attention[i]) for i in range(len(all_labels))])
+    
+    # デバッグ: 予測方法が正しいことを確認
+    print(f"【予測方法の確認】")
+    print(f"  使用しているアテンションウェイト: 正規化前（all_attention）")
+    print(f"  予測サンプル数: {len(final_predictions)}")
+    print(f"  最初の5サンプルの予測: {final_predictions[:5]}")
+    print()
     
     # デバッグ: 予測の分布を確認
     unique_predictions, prediction_counts = np.unique(final_predictions, return_counts=True)
