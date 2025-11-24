@@ -25,7 +25,7 @@ def compute_noise_detection_reconstruction_loss(
     
     Args:
         predicted_mask: 予測されたノイズマスク (batch_size, 30) - 各区間のノイズ強度
-        reconstructed_interval: 復元された区間 (batch_size, max_length) - 予測区間±2区間（最大500ポイント）
+        reconstructed_interval: 復元された区間 (batch_size, max_length) - 予測区間±1区間（最大300ポイント）
         reconstructed_intervals_info: 復元範囲の情報 (batch_size, 3) - [start_interval, end_interval, predicted_interval]
         true_mask: 真のノイズマスク (batch_size, 30) - 各区間のノイズ有無（0 or 1）
         original_psd: 元のPSDデータ（ノイズ付与前） (batch_size, 3000)
@@ -66,7 +66,7 @@ def compute_noise_detection_reconstruction_loss(
             num_correct_masks += 1
             
             # マスク予測が正しい場合のみ復元損失を計算
-            # 予測区間±2区間（合計5区間）の復元精度を評価
+            # 予測区間±1区間（合計3区間）の復元精度を評価
             # 復元範囲の情報を取得
             start_interval = reconstructed_intervals_info[i, 0].item()
             end_interval = reconstructed_intervals_info[i, 1].item()

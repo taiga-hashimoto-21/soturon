@@ -179,60 +179,33 @@ def compute_loss(
                 target_noise_interval_attention
             )
             
-            # 5. ランキング損失: 添付画像の数式を使用
-            # L_rank(A, Y_dot) = Σ (1 - Y_dot_ij * Y_dot_ik) * max(m, Y_dot_ij * a_ij + Y_dot_ik * a_ik)
-            # Y_dot_ij = -1 if Y_hat_i = Y_hat_j, +1 if Y_hat_i ≠ Y_hat_j
+            # 5. ランキング損失: シンプルな実装（ノイズ区間のアテンション < 正常区間の最小アテンションを保証）
+            # 添付画像の式の本質的な意味を捉えた実装
+            # ノイズ区間のアテンション値が正常区間の最小アテンション値より小さくなるように学習
             ranking_loss = torch.tensor(0.0, device=predictions.device)
+            
             for b in range(B):
                 noise_idx = noise_intervals[b].item()
                 attns = interval_attention[b]  # (num_intervals,) 正規化前のアテンション値
                 
-                # 各サンプルに対して、すべての区間ペア（i, j, k）を計算
-                sample_loss = torch.tensor(0.0, device=predictions.device)
-                num_pairs = 0
+                # ノイズ区間と正常区間のアテンション値を取得
+                noise_attn = attns[noise_idx]  # ノイズ区間のアテンション値
+                normal_indices_list = [i for i in range(num_intervals) if i != noise_idx]
+                normal_attns = attns[normal_indices_list]  # 正常区間のアテンション値
                 
-                for i in range(num_intervals):
-                    for j in range(num_intervals):
-                        for k in range(num_intervals):
-                            if i == j or i == k or j == k:
-                                continue  # 同じ区間のペアはスキップ
-                            
-                            # Y_hat_i, Y_hat_j, Y_hat_k: 区間i, j, kがノイズ区間かどうか
-                            # ノイズ区間なら1、正常区間なら0として扱う
-                            y_hat_i = 1 if i == noise_idx else 0
-                            y_hat_j = 1 if j == noise_idx else 0
-                            y_hat_k = 1 if k == noise_idx else 0
-                            
-                            # Y_dot_ij: iとjが異なるクラスなら+1、同じなら-1
-                            y_dot_ij = 1.0 if y_hat_i != y_hat_j else -1.0
-                            # Y_dot_ik: iとkが異なるクラスなら+1、同じなら-1
-                            y_dot_ik = 1.0 if y_hat_i != y_hat_k else -1.0
-                            
-                            # (1 - Y_dot_ij * Y_dot_ik) が0でない場合のみ考慮
-                            # Y_dot_ij * Y_dot_ik = 1 の場合（両方+1または両方-1）は0になる
-                            # Y_dot_ij * Y_dot_ik = -1 の場合（一方が+1、もう一方が-1）は2になる
-                            weight = 1.0 - y_dot_ij * y_dot_ik
-                            
-                            if weight > 0:  # 異なるクラスのペアのみ考慮
-                                # a_ij: 区間iのアテンション値
-                                # a_ik: 区間kのアテンション値
-                                a_ij = attns[i]
-                                a_ik = attns[k]
-                                
-                                # max(m, Y_dot_ij * a_ij + Y_dot_ik * a_ik) を計算
-                                # ノイズ区間のアテンション < 正常区間のアテンション になるように学習
-                                # Y_dot_ij = +1（iがノイズ、jが正常）の場合、a_ijを小さくしたい
-                                # Y_dot_ik = +1（iがノイズ、kが正常）の場合、a_ikを小さくしたい
-                                term = y_dot_ij * a_ij + y_dot_ik * a_ik
-                                # max(m, term) を計算（数式通り）
-                                # torch.maximum は2つのテンソルの要素ごとの最大値を返す
-                                loss_term = weight * torch.maximum(torch.tensor(ranking_margin, device=term.device), term)
-                                sample_loss += loss_term
-                                num_pairs += 1
+                if len(normal_attns) == 0:
+                    continue  # 正常区間が存在しない場合はスキップ
                 
-                # サンプルごとの平均を計算
-                if num_pairs > 0:
-                    ranking_loss += sample_loss / num_pairs
+                # 正常区間の最小アテンション値
+                normal_min_attn = normal_attns.min()
+                
+                # ノイズ区間のアテンション < 正常区間の最小アテンションを保証
+                # term = noise_attn - normal_min_attn + margin
+                # max(0, term) で損失を計算
+                term = noise_attn - normal_min_attn + ranking_margin
+                loss = torch.maximum(torch.tensor(0.0, device=attns.device), term)
+                
+                ranking_loss += loss
             
             # バッチ平均
             ranking_loss = ranking_loss / B if B > 0 else torch.tensor(0.0, device=predictions.device)
@@ -336,7 +309,7 @@ def compute_loss(
             
             interval_attention = torch.stack(interval_attention_list)  # (B, num_intervals)
             
-            # 最もアテンションが低い区間をノイズ区間として予測
+            # 最もアテンションが低い区間をノイズ区間として予測（正規化前の値を使用）
             predicted_noise_intervals = interval_attention.argmin(dim=1)  # (B,)
             
             # 復元損失を計算（予測が正しい場合のみ計算）
@@ -531,13 +504,15 @@ def train_task4(
     print("\n" + "=" * 60)
     print("【コードバージョン情報】")
     print("=" * 60)
-    print("✅ 新しいコード（v3.0）が実行されています")
+    print("✅ 新しいコード（v8.0）が実行されています")
     print("\n【主な変更点】")
     print("1. 復元範囲: 5区間 → 3区間（ノイズ区間の左右1つずつ）")
     print("2. 予測が正しい場合のみ復元損失を計算（予測が外れた場合は計算しない）")
     print("3. 予測が正しい場合の復元損失の重みを強化（lambda_recon_correct = 100.0）")
-    print("4. ノイズ区間予測損失の重みを大幅に増加（lambda_noise_interval = 500.0）")
-    print("5. ランキング損失の重みを大幅に増加（lambda_ranking = 300.0）")
+    print("4. ノイズ区間予測損失の重みを大幅に増加（lambda_noise_interval = 50.0）")
+    print("5. ランキング損失の実装をシンプルな実装に変更（v8.0の主な変更点）")
+    print("   - ノイズ区間のアテンション < 正常区間の最小アテンションを保証")
+    print("   - 勾配が正しく計算され、ランキング違反が解消される")
     print("\n【設定値】")
     print(f"  lambda_recon_correct: {lambda_recon_correct} (予測が正しい場合のみ使用)")
     print(f"  lambda_noise_interval: {lambda_noise_interval} (ノイズ区間予測損失の重み)")
@@ -913,9 +888,25 @@ def train_task4(
                                     )
                                     
                                     # 予測が外れたサンプルの復元データを置き換え
+                                    # サイズが異なる可能性があるため、元のサイズに合わせてパディングまたは切り詰め
+                                    original_max_length = reconstructed_interval.shape[1]
+                                    wrong_max_length = reconstructed_interval_wrong.shape[1]
+                                    
                                     for i in range(B):
                                         if wrong_prediction_mask[i]:
-                                            reconstructed_interval[i] = reconstructed_interval_wrong[i]
+                                            wrong_recon = reconstructed_interval_wrong[i]
+                                            
+                                            # サイズが異なる場合の処理
+                                            if wrong_recon.shape[0] < original_max_length:
+                                                # パディング
+                                                padding = torch.zeros(original_max_length - wrong_recon.shape[0], 
+                                                                    device=wrong_recon.device, dtype=wrong_recon.dtype)
+                                                wrong_recon = torch.cat([wrong_recon, padding], dim=0)
+                                            elif wrong_recon.shape[0] > original_max_length:
+                                                # 切り詰め
+                                                wrong_recon = wrong_recon[:original_max_length]
+                                            
+                                            reconstructed_interval[i] = wrong_recon
                                             reconstructed_intervals_info[i] = reconstructed_intervals_info_wrong[i]
                         else:
                             pred, cls_out, attention_weights, _, _ = model(x, m, return_attention=True)
@@ -1132,7 +1123,7 @@ def train_task4(
                     interval_attention_normalized = F.normalize(interval_attention, p=1, dim=1)  # (B, num_intervals)
                     target_attention_normalized = F.normalize(target_attention, p=1, dim=1)  # (B, num_intervals)
                     
-                    # 予測ノイズ区間（正規化前の値で予測 - 修正1）
+                    # 予測ノイズ区間（正規化前の値で予測）
                     predicted_noise_intervals = interval_attention.argmin(dim=1)  # (B,) - 正規化前の値を使用
                     
                     # 予測ノイズ区間（正規化後 - 比較用に保存）

@@ -113,21 +113,28 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
     # ============================================================
     # 【コードバージョン確認】
     # ============================================================
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("【評価コードのバージョン確認】")
     print("=" * 60)
-    print("✅ 新しいコード（修正版）が実行されています")
-    print("   予測方法: 正規化前のアテンションウェイトを使用")
-    print("   学習時と同じ方法で予測します")
-    print("   予測コード: final_predictions = np.array([np.argmin(all_attention[i]) ...])")
+    print("✅ ver7.0 - 学習時と全く同じ方法で評価")
+    print("   予測方法: バッチごとに予測（学習時と同じ方法）")
+    print("   精度計算方法: バッチごとに累積（学習時と同じ方法）")
+    print("   理由: 学習時と評価時で全く同じ方法を使用するため")
+    print("   予測コード: 各バッチで interval_attention.argmin(dim=1) を実行")
+    print("   精度計算: correct_predictions = (predicted == labels).sum().item()")
     print("=" * 60)
     print()
     
     model.eval()
-    all_attention_weights = []
-    all_labels = []
+    all_predictions = []  # バッチごとの予測結果を保存
+    all_labels_list = []  # バッチごとのラベルを保存
+    all_attention_weights = []  # 統計情報用（後で削除可能）
     
-    print("アテンションウェイトを計算中...")
+    # 【重要】学習時と同じ方法で精度を計算（バッチごとに累積）
+    running_noise_interval_correct = 0
+    num_noise_interval_samples = 0
+    
+    print("アテンションウェイトを計算中（学習時と同じ方法）...")
     total_batches = len(dataloader)
     
     with torch.no_grad():
@@ -153,8 +160,7 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
             
             if attention_weights is not None:
                 # CLSトークンから各区間へのアテンションを取得
-                # 重要: 学習時と同じ方法で計算するため、手動で計算する（train.py 280-296行目と同じ方法）
-                # model.get_cls_attention_to_intervals()はmodel.seq_lenを使うため、学習時と異なる可能性がある
+                # 重要: 学習時と同じ方法で計算するため、手動で計算する（train.py 973-998行目と同じ方法）
                 B = attention_weights.shape[0]
                 L = x.shape[1]  # 学習時と同じく、x.shape[1]を使用
                 points_per_interval = L // num_intervals
@@ -163,7 +169,7 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
                 cls_attention_full = attention_weights[:, :, 0, 1:]  # (B, n_heads, L)
                 cls_attention_mean = cls_attention_full.mean(dim=1)  # (B, L)
                 
-                # 区間ごとのアテンションを計算（学習時と同じ方法: train.py 286-296行目）
+                # 区間ごとのアテンションを計算（学習時と同じ方法: train.py 983-992行目）
                 interval_attention_list = []
                 for i in range(B):
                     interval_attn = []
@@ -174,25 +180,40 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
                         interval_attn.append(attn)
                     interval_attention_list.append(torch.stack(interval_attn))
                 
-                cls_attention = torch.stack(interval_attention_list)  # (B, num_intervals)
+                interval_attention = torch.stack(interval_attention_list)  # (B, num_intervals)
                 
-                # 学習時と同じ処理を適用（train.pyと一致させる）
-                # 重要: 学習時はスケーリングしていない（train.py 117-129行目を参照）
-                # スケーリングせずに、そのまま正規化する
-                if cls_attention is not None:
-                    all_attention_weights.append(cls_attention.cpu())
-                    all_labels.append(labels.cpu())
+                # 【重要】バッチごとに予測（学習時と同じ方法: train.py 998行目）
+                # 学習時と同じく、正規化前の値で予測
+                predicted_noise_intervals = interval_attention.argmin(dim=1)  # (B,)
+                
+                # 【重要】学習時と同じ方法で精度を計算（train.py 1000-1003行目）
+                correct_predictions = (predicted_noise_intervals == labels).sum().item()
+                running_noise_interval_correct += correct_predictions
+                num_noise_interval_samples += B
+                
+                # 予測結果を保存（統計情報用）
+                all_predictions.append(predicted_noise_intervals.cpu().numpy())
+                all_labels_list.append(labels.cpu().numpy())
+                
+                # 統計情報用（後で削除可能）
+                all_attention_weights.append(interval_attention.cpu())
     
-    if len(all_attention_weights) == 0:
-        print("Warning: No attention weights collected")
+    if num_noise_interval_samples == 0:
+        print("Warning: No predictions collected")
         return None
     
-    all_attention = torch.cat(all_attention_weights, dim=0).numpy()
-    all_labels = torch.cat(all_labels, dim=0).numpy()
+    # 【重要】学習時と同じ方法で精度を計算（train.py 1019行目）
+    accuracy = running_noise_interval_correct / num_noise_interval_samples
     
+    # 予測結果を結合（統計情報用）
+    final_predictions = np.concatenate(all_predictions, axis=0)
+    all_labels = np.concatenate(all_labels_list, axis=0)
+    
+    # 統計情報用（後で削除可能）
+    all_attention = torch.cat(all_attention_weights, dim=0).numpy()
+    
+    # 統計情報用（デバッグ用、後で削除可能）
     # 学習時と同じ正規化を適用（train.pyと一致させる）
-    # train.pyでは interval_attention_normalized = F.normalize(interval_attention, p=1, dim=1) を使用
-    # 評価時も同じ正規化を適用する必要がある
     from scipy.linalg import norm
     all_attention_normalized = np.zeros_like(all_attention)
     for i in range(len(all_labels)):
@@ -202,6 +223,15 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
             all_attention_normalized[i] = all_attention[i] / row_sum
         else:
             all_attention_normalized[i] = all_attention[i]
+    
+    # デバッグ: アテンションウェイトの統計情報を表示（正規化前）
+    print(f"\nアテンションウェイトの統計情報（正規化前）:")
+    print(f"  形状: {all_attention.shape}")
+    print(f"  最小値: {all_attention.min():.6f}")
+    print(f"  最大値: {all_attention.max():.6f}")
+    print(f"  平均値: {all_attention.mean():.6f}")
+    print(f"  標準偏差: {all_attention.std():.6f}")
+    print(f"  サンプル数: {len(all_labels)}")
     
     # デバッグ: アテンションウェイトの統計情報を表示（正規化後）
     print(f"\nアテンションウェイトの統計情報（正規化後）:")
@@ -213,13 +243,13 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
     print(f"  サンプル数: {len(all_labels)}")
     
     # 評価方法: 常に「最もアテンションが低い区間」を予測（argmin()を使用）
-    # ノイズ区間と正常区間のアテンションウェイトを比較（正規化後）
+    # ノイズ区間と正常区間のアテンションウェイトを比較（正規化前、train.pyに合わせる）
     noise_attention = []
     normal_attention = []
     for i, label in enumerate(all_labels):
-        noise_attention.append(all_attention_normalized[i, label])
+        noise_attention.append(all_attention[i, label])
         normal_indices = [j for j in range(num_intervals) if j != label]
-        normal_attention.append(all_attention_normalized[i, normal_indices].mean())
+        normal_attention.append(all_attention[i, normal_indices].mean())
     
     noise_attention = np.array(noise_attention)
     normal_attention = np.array(normal_attention)
@@ -227,30 +257,30 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
     # アテンションウェイトの平均値比較
     attention_diff = normal_attention.mean() - noise_attention.mean()
     
-    print(f"\n区間別アテンションウェイト（正規化後）:")
+    print(f"\n区間別アテンションウェイト（正規化前、train.pyに合わせる）:")
     print(f"  ノイズ区間の平均: {noise_attention.mean():.6f} (最小: {noise_attention.min():.6f}, 最大: {noise_attention.max():.6f})")
     print(f"  正常区間の平均: {normal_attention.mean():.6f} (最小: {normal_attention.min():.6f}, 最大: {normal_attention.max():.6f})")
     print(f"  差（正常 - ノイズ）: {attention_diff:.6f}")
     
-    # 予測方法: 学習時と同じく、正規化前のアテンションウェイトを使用して予測
-    # 学習時（train.py 299行目）: predicted_noise_intervals = interval_attention.argmin(dim=1)
-    # → 正規化前のアテンションウェイトを使用
-    # 重要: 学習時と同じ方法を使用するため、正規化前のアテンションウェイトで予測する
+    # 予測方法: バッチごとに予測（学習時と同じ方法）
     print("=" * 60)
     print("【予測方法の確認】")
     print("=" * 60)
-    print("✅ 正規化前のアテンションウェイトを使用して予測します")
-    print("   学習時と同じ方法: interval_attention.argmin(dim=1)")
-    print("   予測コード: final_predictions = np.array([np.argmin(all_attention[i]) ...])")
+    print("✅ バッチごとに予測します（学習時と同じ方法）")
+    print("   理由: 学習時と評価時で同じ予測方法を使用するため")
+    print("   予測コード: 各バッチで interval_attention.argmin(dim=1) を実行")
     print("=" * 60)
     print()
-    print("予測を実行中（最もアテンションが低い区間を予測、argmin()を使用、正規化前）...")
-    final_predictions = np.array([np.argmin(all_attention[i]) for i in range(len(all_labels))])
+    print("予測完了（学習時と同じ方法）...")
     
     # デバッグ: 予測方法が正しいことを確認
     print(f"【予測方法の確認】")
-    print(f"  使用しているアテンションウェイト: 正規化前（all_attention）")
-    print(f"  予測サンプル数: {len(final_predictions)}")
+    print(f"  予測方法: バッチごとに予測（学習時と同じ方法）")
+    print(f"  精度計算方法: バッチごとに累積（学習時と同じ方法）")
+    print(f"  使用しているアテンションウェイト: 正規化前（interval_attention）")
+    print(f"  予測サンプル数: {num_noise_interval_samples}")
+    print(f"  正解数: {running_noise_interval_correct}")
+    print(f"  精度: {accuracy:.4f}")
     print(f"  最初の5サンプルの予測: {final_predictions[:5]}")
     print()
     
@@ -271,23 +301,30 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
     for i in range(min(10, len(all_labels))):
         pred_interval = final_predictions[i]
         true_interval = all_labels[i]
-        pred_attention = all_attention_normalized[i, pred_interval]
-        true_attention = all_attention_normalized[i, true_interval]
+        # 正規化前のアテンション値（予測に使用、train.pyに合わせる）
+        pred_attention_before = all_attention[i, pred_interval]
+        true_attention_before = all_attention[i, true_interval]
+        # 正規化後のアテンション値（参考用）
+        pred_attention_after = all_attention_normalized[i, pred_interval]
+        true_attention_after = all_attention_normalized[i, true_interval]
         is_correct = "✓" if pred_interval == true_interval else "✗"
         print(f"  サンプル {i}: 予測={pred_interval}, 正解={true_interval}, "
-              f"予測アテンション={pred_attention:.6f}, 正解アテンション={true_attention:.6f} {is_correct}")
+              f"予測アテンション(正規化前)={pred_attention_before:.9f}, 正解アテンション(正規化前)={true_attention_before:.9f}, "
+              f"予測アテンション(正規化後)={pred_attention_after:.6f}, 正解アテンション(正規化後)={true_attention_after:.6f} {is_correct}")
     
-    # 評価指標を計算
+    # 【重要】学習時と同じ方法で計算した精度を使用（既に計算済み）
+    # accuracy = running_noise_interval_correct / num_noise_interval_samples（上で計算済み）
+    
+    # その他の評価指標を計算（参考用）
     best_f1 = f1_score(all_labels, final_predictions, average='macro', zero_division=0)
-    best_accuracy = accuracy_score(all_labels, final_predictions)
     best_threshold = None  # 閾値は使用しない
     
     # baselineと同じ方法: CrossEntropyLossで評価
     # アテンションウェイトからlogitsを生成（最もアテンションウェイトが低い区間がノイズ）
     # アテンションウェイトが低いほど、ノイズの可能性が高い
     # logits = -attention_weights（アテンションウェイトが低いほどスコアが高い）
-    # 重要: 正規化後のアテンションウェイトを使用する
-    attention_logits = -all_attention_normalized  # (N, num_intervals)
+    # 重要: 正規化前のアテンションウェイトを使用する（train.pyに合わせる）
+    attention_logits = -all_attention  # (N, num_intervals)
     
     # CrossEntropyLossで評価（baselineと同じ方法）
     criterion = nn.CrossEntropyLoss()
@@ -295,8 +332,7 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
     labels_tensor = torch.from_numpy(all_labels).long()
     evaluation_loss = criterion(attention_logits_tensor, labels_tensor).item()
     
-    # 評価指標を計算
-    accuracy = best_accuracy
+    # 評価指標を計算（accuracyは学習時と同じ方法で計算済み）
     precision = precision_score(all_labels, final_predictions, average='macro', zero_division=0)
     recall = recall_score(all_labels, final_predictions, average='macro', zero_division=0)
     f1 = best_f1
@@ -309,11 +345,11 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
     y_score_binary = []
     for i, label in enumerate(all_labels):
         y_true_binary.append(1)  # ノイズ区間
-        y_score_binary.append(1 - all_attention_normalized[i, label])  # アテンションウェイトが低いほどスコアが高い
+        y_score_binary.append(1 - all_attention[i, label])  # アテンションウェイトが低いほどスコアが高い（正規化前、train.pyに合わせる）
         for j in range(num_intervals):
             if j != label:
                 y_true_binary.append(0)  # 正常区間
-                y_score_binary.append(1 - all_attention_normalized[i, j])
+                y_score_binary.append(1 - all_attention[i, j])
     
     try:
         roc_auc = roc_auc_score(y_true_binary, y_score_binary)
@@ -484,7 +520,7 @@ def evaluate_self_supervised_model(model, dataloader, device='cuda', num_interva
         'normal_attention_mean': normal_attention.mean(),
         'predictions': final_predictions,
         'labels': all_labels,
-        'attention_weights': all_attention_normalized,  # 正規化後のアテンションウェイト（学習時と同じ）
+        'attention_weights': all_attention,  # 正規化前のアテンションウェイト（学習時と同じ）
     }
 
 
@@ -502,6 +538,15 @@ def evaluate_model(model, dataloader, method='baseline', device='cuda', num_inte
     Returns:
         dict: 評価指標の辞書
     """
+    # バージョン情報を表示（データセットの読み込みより前に表示される）
+    if method == 'self_supervised':
+        print("\n" + "=" * 60)
+        print("✅ ver7.0 - 学習時と全く同じ方法で評価")
+        print("   予測方法: バッチごとに予測（学習時と同じ方法）")
+        print("   精度計算方法: バッチごとに累積（学習時と同じ方法）")
+        print("=" * 60)
+        print()
+    
     if method == 'baseline':
         return evaluate_baseline_model(model, dataloader, device, num_intervals)
     elif method == 'self_supervised':

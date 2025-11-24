@@ -678,7 +678,7 @@ class NoiseDetectionAndReconstructionModel(nn.Module):
         
         Returns:
             mask: ノイズマスク (batch_size, 30) - 各区間のノイズ強度
-            reconstructed_intervals: 復元された区間 (batch_size, max_length) - 予測区間±2区間（最大500ポイント）
+            reconstructed_intervals: 復元された区間 (batch_size, max_length) - 予測区間±1区間（最大300ポイント）
             reconstructed_intervals_info: 復元範囲の情報 (batch_size, 3) - [start_interval, end_interval, predicted_interval]
         """
         batch_size = x.size(0)
@@ -756,10 +756,10 @@ class NoiseDetectionAndReconstructionModel(nn.Module):
             (1 - mask_expanded) * interval_features
         )
         
-        # ===== 5. 予測した区間±2区間（合計5区間）を復元 =====
-        # 最も確信度の高い区間（予測区間）を中心に、左右2区間ずつ復元
+        # ===== 5. 予測した区間±1区間（合計3区間）を復元 =====
+        # 最も確信度の高い区間（予測区間）を中心に、左右1区間ずつ復元
         predicted_intervals = mask.argmax(dim=1)  # (batch_size,) - 予測された区間
-        window_size = 2  # 左右に2区間ずつ
+        window_size = 1  # 左右に1区間ずつ
         
         reconstructed_intervals_list = []
         reconstructed_intervals_info_list = []
@@ -767,19 +767,19 @@ class NoiseDetectionAndReconstructionModel(nn.Module):
         for i in range(batch_size):
             predicted_interval = predicted_intervals[i].item()
             
-            # 復元する区間の範囲を決定（予測区間±2区間）
+            # 復元する区間の範囲を決定（予測区間±1区間）
             start_interval = max(0, predicted_interval - window_size)
             end_interval = min(self.num_intervals - 1, predicted_interval + window_size)
             num_intervals_to_reconstruct = end_interval - start_interval + 1
             
-            # 5区間分の特徴を取得して復元
+            # 3区間分の特徴を取得して復元
             reconstructed_parts = []
             for interval_idx in range(start_interval, end_interval + 1):
                 interval_feat = reconstructed_interval_features[i, interval_idx, :]  # (128,)
                 reconstructed_interval_single = self.interval_decoder(interval_feat.unsqueeze(0))  # (1, 100)
                 reconstructed_parts.append(reconstructed_interval_single.squeeze(0))  # (100,)
             
-            # 5区間分を結合（合計500ポイント）
+            # 3区間分を結合（合計300ポイント）
             reconstructed_combined = torch.cat(reconstructed_parts, dim=0)  # (num_intervals_to_reconstruct * 100,)
             reconstructed_intervals_list.append(reconstructed_combined)
             
