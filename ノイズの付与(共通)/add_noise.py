@@ -4,25 +4,21 @@
 統合インターフェースとして機能
 """
 
-# 相対インポート（同じディレクトリ内のモジュール）
-# パッケージとしてインポートされる場合と直接インポートされる場合の両方に対応
+# 絶対インポート（Google Colabなどでも動作するように）
 import sys
 import os
 
 # 現在のディレクトリを取得
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
-try:
-    # パッケージとしてインポートされる場合
-    from .power_supply_noise import add_power_supply_noise
-    from .interference_noise import add_interference_noise
-    from .clock_leakage_noise import add_clock_leakage_noise
-except ImportError:
-    # 直接インポートされる場合
+# 現在のディレクトリをパスに追加（まだ追加されていない場合）
+if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
-    from power_supply_noise import add_power_supply_noise
-    from interference_noise import add_interference_noise
-    from clock_leakage_noise import add_clock_leakage_noise
+
+# 直接インポート（同じディレクトリ内のモジュール）
+from power_supply_noise import add_power_supply_noise
+from interference_noise import add_interference_noise
+from clock_leakage_noise import add_clock_leakage_noise
 
 
 def add_noise_to_interval(psd_data, interval_idx, noise_type='power_supply', **kwargs):

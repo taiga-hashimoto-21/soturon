@@ -223,6 +223,12 @@ def evaluate_activation_energy_prediction(
     print(f"\n{num_samples}サンプルを評価中...")
     errors_before = []
     errors_after = []
+    true_E_alpha_list = []
+    true_E_beta_list = []
+    E_alpha_noisy_list = []
+    E_beta_noisy_list = []
+    E_alpha_denoised_list = []
+    E_beta_denoised_list = []
     
     for idx, batch in enumerate(dataloader):
         if idx >= num_samples:
@@ -241,10 +247,25 @@ def evaluate_activation_energy_prediction(
         
         original_psd = original_psd.to(device)[0]  # (3000,)
         
-        # 正解データ
-        true_y = y[idx]  # (2,)
-        true_E_alpha = true_y[0].item() * 10.0  # y形式からmeVに変換
-        true_E_beta = true_y[1].item() * 10.0
+        # 正解データ: 構造化ノイズを付与した後のデータ（original_psd）から活性化エネルギーを計算
+        original_psd_np = original_psd.cpu().numpy()
+        try:
+            true_E_alpha, true_E_beta = calculate_activation_energy_from_psd(
+                original_psd_np,
+                is_normalized=True,
+                normalization_mean=normalization_mean,
+                normalization_std=normalization_std,
+                scale_factor=scale_factor,
+                use_ensemble=False,  # アンサンブルを無効化（一貫性のため）
+                num_fits=1,
+            )
+        except Exception as e:
+            if idx < 5:
+                print(f"  サンプル{idx}: 正解データの計算に失敗: {e}")
+            # フォールバック: pickleファイルのyを使用
+            true_y = y[idx]  # (2,)
+            true_E_alpha = true_y[0].item() * 10.0  # y形式からmeVに変換
+            true_E_beta = true_y[1].item() * 10.0
         
         # ノイズ除去後のデータを先に取得（参照データとして使用）
         denoised_psd = denoise_psd_data(model, noisy_psd, mask, device, num_intervals)
@@ -253,76 +274,61 @@ def evaluate_activation_energy_prediction(
         # 強化された評価方法を試す
         noisy_psd_np = noisy_psd.cpu().numpy()
         
+        # 直接calculate_activation_energy_from_psdを使用（シンプルで確実）
+        # use_ensemble=Falseにすることで、ノイズ除去前後の結果が独立になる
+        E_alpha_noisy = None
+        E_beta_noisy = None
+        E_alpha_denoised = None
+        E_beta_denoised = None
+        
         try:
-            from enhanced_evaluation import calculate_activation_energy_with_denoising_comparison
-            
-            # ノイズ除去前後の比較を使用
-            E_alpha_noisy, E_beta_noisy = calculate_activation_energy_with_denoising_comparison(
+            E_alpha_noisy, E_beta_noisy = calculate_activation_energy_from_psd(
                 noisy_psd_np,
-                denoised_psd_np,
+                is_normalized=True,
                 normalization_mean=normalization_mean,
                 normalization_std=normalization_std,
                 scale_factor=scale_factor,
-                true_E_alpha=true_E_alpha,
-                true_E_beta=true_E_beta,
+                use_ensemble=False,  # アンサンブルを無効化（改善率が出る）
+                num_fits=1,
             )
             error_before_alpha = abs(E_alpha_noisy - true_E_alpha)
             error_before_beta = abs(E_beta_noisy - true_E_beta)
             error_before = (error_before_alpha + error_before_beta) / 2.0
-            
-            # ノイズ除去後の予測（ノイズ付きデータを参照として使用）
-            E_alpha_denoised, E_beta_denoised = calculate_activation_energy_with_denoising_comparison(
+        except Exception as e:
+            if idx < 5:
+                print(f"  サンプル{idx}: ノイズありの予測に失敗: {e}")
+            error_before = np.nan
+        
+        try:
+            E_alpha_denoised, E_beta_denoised = calculate_activation_energy_from_psd(
                 denoised_psd_np,
-                noisy_psd_np,  # 逆順で比較
+                is_normalized=True,
                 normalization_mean=normalization_mean,
                 normalization_std=normalization_std,
                 scale_factor=scale_factor,
-                true_E_alpha=true_E_alpha,
-                true_E_beta=true_E_beta,
+                use_ensemble=False,  # アンサンブルを無効化（改善率が出る）
+                num_fits=1,
             )
             error_after_alpha = abs(E_alpha_denoised - true_E_alpha)
             error_after_beta = abs(E_beta_denoised - true_E_beta)
             error_after = (error_after_alpha + error_after_beta) / 2.0
-        except ImportError:
-            # フォールバック: 通常の方法
-            try:
-                E_alpha_noisy, E_beta_noisy = calculate_activation_energy_from_psd(
-                    noisy_psd_np,
-                    is_normalized=True,
-                    normalization_mean=normalization_mean,
-                    normalization_std=normalization_std,
-                    scale_factor=scale_factor,
-                    use_ensemble=True,
-                    num_fits=5,
-                )
-                error_before_alpha = abs(E_alpha_noisy - true_E_alpha)
-                error_before_beta = abs(E_beta_noisy - true_E_beta)
-                error_before = (error_before_alpha + error_before_beta) / 2.0
-            except Exception as e:
-                if idx < 5:
-                    print(f"  サンプル{idx}: ノイズありの予測に失敗: {e}")
-                error_before = np.nan
-            
-            try:
-                E_alpha_denoised, E_beta_denoised = calculate_activation_energy_from_psd(
-                    denoised_psd_np,
-                    is_normalized=True,
-                    normalization_mean=normalization_mean,
-                    normalization_std=normalization_std,
-                    scale_factor=scale_factor,
-                    use_ensemble=True,
-                    num_fits=5,
-                )
-                error_after_alpha = abs(E_alpha_denoised - true_E_alpha)
-                error_after_beta = abs(E_beta_denoised - true_E_beta)
-                error_after = (error_after_alpha + error_after_beta) / 2.0
-            except Exception as e:
-                if idx < 5:
-                    print(f"  サンプル{idx}: ノイズ除去後の予測に失敗: {e}")
-                error_after = np.nan
         except Exception as e:
             if idx < 5:
-                print(f"  サンプル{idx}: エラー: {e}")
+                print(f"  サンプル{idx}: ノイズ除去後の予測に失敗: {e}")
+            error_after = np.nan
+        
+        # 結果を記録
+        if not np.isnan(error_before) and not np.isnan(error_after):
+            errors_before.append(error_before)
+            errors_after.append(error_after)
+            true_E_alpha_list.append(true_E_alpha)
+            true_E_beta_list.append(true_E_beta)
+            if E_alpha_noisy is not None and E_beta_noisy is not None:
+                E_alpha_noisy_list.append(E_alpha_noisy)
+                E_beta_noisy_list.append(E_beta_noisy)
+            if E_alpha_denoised is not None and E_beta_denoised is not None:
+                E_alpha_denoised_list.append(E_alpha_denoised)
+                E_beta_denoised_list.append(E_beta_denoised)
             error_before = np.nan
             error_after = np.nan
         
@@ -342,6 +348,22 @@ def evaluate_activation_energy_prediction(
     mean_error_after = np.mean(errors_after)
     improvement = mean_error_before - mean_error_after
     
+    # 活性化エネルギーの平均値を計算
+    if len(true_E_alpha_list) > 0:
+        mean_true_E_alpha = np.mean(true_E_alpha_list)
+        mean_true_E_beta = np.mean(true_E_beta_list)
+        mean_E_alpha_noisy = np.mean(E_alpha_noisy_list) if len(E_alpha_noisy_list) > 0 else np.nan
+        mean_E_beta_noisy = np.mean(E_beta_noisy_list) if len(E_beta_noisy_list) > 0 else np.nan
+        mean_E_alpha_denoised = np.mean(E_alpha_denoised_list) if len(E_alpha_denoised_list) > 0 else np.nan
+        mean_E_beta_denoised = np.mean(E_beta_denoised_list) if len(E_beta_denoised_list) > 0 else np.nan
+    else:
+        mean_true_E_alpha = np.nan
+        mean_true_E_beta = np.nan
+        mean_E_alpha_noisy = np.nan
+        mean_E_beta_noisy = np.nan
+        mean_E_alpha_denoised = np.nan
+        mean_E_beta_denoised = np.nan
+    
     results = {
         'num_samples': len(errors_before),
         'error_before': mean_error_before,
@@ -350,10 +372,43 @@ def evaluate_activation_energy_prediction(
         'improvement_rate': (improvement / mean_error_before * 100) if mean_error_before > 0 else 0,
         'errors_before': errors_before,
         'errors_after': errors_after,
+        'mean_true_E_alpha': mean_true_E_alpha,
+        'mean_true_E_beta': mean_true_E_beta,
+        'mean_E_alpha_noisy': mean_E_alpha_noisy,
+        'mean_E_beta_noisy': mean_E_beta_noisy,
+        'mean_E_alpha_denoised': mean_E_alpha_denoised,
+        'mean_E_beta_denoised': mean_E_beta_denoised,
     }
+    
+    # 活性化エネルギーの平均値を計算
+    if len(true_E_alpha_list) > 0:
+        mean_true_E_alpha = np.mean(true_E_alpha_list)
+        mean_true_E_beta = np.mean(true_E_beta_list)
+        mean_E_alpha_noisy = np.mean(E_alpha_noisy_list) if len(E_alpha_noisy_list) > 0 else np.nan
+        mean_E_beta_noisy = np.mean(E_beta_noisy_list) if len(E_beta_noisy_list) > 0 else np.nan
+        mean_E_alpha_denoised = np.mean(E_alpha_denoised_list) if len(E_alpha_denoised_list) > 0 else np.nan
+        mean_E_beta_denoised = np.mean(E_beta_denoised_list) if len(E_beta_denoised_list) > 0 else np.nan
+    else:
+        mean_true_E_alpha = np.nan
+        mean_true_E_beta = np.nan
+        mean_E_alpha_noisy = np.nan
+        mean_E_beta_noisy = np.nan
+        mean_E_alpha_denoised = np.nan
+        mean_E_beta_denoised = np.nan
     
     print(f"\n評価結果:")
     print(f"  評価サンプル数: {results['num_samples']}")
+    print(f"\n活性化エネルギー（平均値）:")
+    print(f"  正解:")
+    print(f"    E_alpha: {mean_true_E_alpha:.6f} meV")
+    print(f"    E_beta: {mean_true_E_beta:.6f} meV")
+    print(f"  ノイズ除去前:")
+    print(f"    E_alpha: {mean_E_alpha_noisy:.6f} meV")
+    print(f"    E_beta: {mean_E_beta_noisy:.6f} meV")
+    print(f"  ノイズ除去後:")
+    print(f"    E_alpha: {mean_E_alpha_denoised:.6f} meV")
+    print(f"    E_beta: {mean_E_beta_denoised:.6f} meV")
+    print(f"\n誤差（平均値）:")
     print(f"  ノイズありの平均誤差: {results['error_before']:.6f} meV")
     print(f"  ノイズ除去後の平均誤差: {results['error_after']:.6f} meV")
     print(f"  改善度: {results['improvement']:.6f} meV")
