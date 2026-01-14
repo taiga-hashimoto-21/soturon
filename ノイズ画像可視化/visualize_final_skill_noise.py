@@ -294,7 +294,11 @@ def add_power_supply_noise_to_psd(psd_data, amplitude_ratio=0.1):
 
 # データの読み込み
 print("PSDデータを読み込み中...")
-with open('data_lowF_noise.pickle', 'rb') as f:
+# プロジェクトルートからデータファイルを読み込む
+data_path = os.path.join(project_root, '..', 'data_lowF_noise.pickle')
+if not os.path.exists(data_path):
+    data_path = os.path.join(os.path.dirname(project_root), 'data_lowF_noise.pickle')
+with open(data_path, 'rb') as f:
     data_psd = pickle.load(f)
 
 sample_idx = 0
@@ -391,7 +395,7 @@ original_color = '#808080'
 
 # 1行目: 元のPSDデータ
 ax_original_psd = axes[0]
-ax_original_psd.plot(frequencies.numpy(), original_psd_np, color=original_color, linewidth=1.5)
+ax_original_psd.plot(frequencies.numpy(), original_psd_np, color=original_color, marker='.', markersize=1.5, linestyle='None')
 ax_original_psd.set_xlabel('周波数 (Hz)', fontsize=11)
 ax_original_psd.set_ylabel('PSD値', fontsize=11)
 ax_original_psd.set_title('元のPSDデータ', fontsize=12, fontweight='bold')
@@ -405,8 +409,8 @@ for i, (noise_name, color) in enumerate(noise_types):
     
     # PSDデータに周波数特性としてノイズを付与した場合
     ax_psd = axes[row_idx]
-    ax_psd.plot(frequencies.numpy(), original_psd_np, color=original_color, linewidth=1.0, alpha=0.5, linestyle='--', label='元のPSDデータ')
-    ax_psd.plot(frequencies.numpy(), case2_psd_data[i], color=color, linewidth=1.5, label='ノイズ付与後')
+    ax_psd.plot(frequencies.numpy(), original_psd_np, color=original_color, marker='.', markersize=1.0, alpha=0.5, linestyle='None', label='元のPSDデータ')
+    ax_psd.plot(frequencies.numpy(), case2_psd_data[i], color=color, marker='.', markersize=1.5, linestyle='None', label='ノイズ付与後')
     ax_psd.set_xlabel('周波数 (Hz)', fontsize=11)
     ax_psd.set_ylabel('PSD値', fontsize=11)
     ax_psd.set_title(f'{noise_name}', fontsize=12, fontweight='bold')
